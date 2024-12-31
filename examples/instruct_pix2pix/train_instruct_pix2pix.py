@@ -23,6 +23,7 @@ import os
 import shutil
 from contextlib import nullcontext
 from pathlib import Path
+import statistics
 
 import accelerate
 import datasets
@@ -51,20 +52,87 @@ from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
-
+from torchvision.transforms import v2
+from skimage.metrics import structural_similarity as ssim
+import cv2
 
 if is_wandb_available():
     import wandb
 
+import sys
+sys.path.append("/graphics/scratch2/students/grosskop/AdaptiveSupervisedPatchNCE/")
+from evaluate import compute_fid
+
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.33.0.dev0")
+check_min_version("0.32.1")
 
 logger = get_logger(__name__, log_level="INFO")
 
-DATASET_NAME_MAPPING = {
-    "fusing/instructpix2pix-1000-samples": ("input_image", "edit_prompt", "edited_image"),
-}
-WANDB_TABLE_COL_NAMES = ["original_image", "edited_image", "edit_prompt"]
+num_inference_steps = 10
+image_guidance_scale = 0
+guidance_scale = 0
+inference_batch_size = 8
+dir_he = Path("/graphics/scratch2/students/grosskop/diffusers/examples/instruct_pix2pix/testset/he/")
+dir_ihc = Path("/graphics/scratch2/students/grosskop/diffusers/examples/instruct_pix2pix/testset/ihc")
+dir_genereated_ihc = Path("/graphics/scratch2/students/grosskop/diffusers_thesis/examples/instruct_pix2pix/testset/ihc_generated/")
+dir_genereated_he = Path("/graphics/scratch2/students/grosskop/diffusers_thesis/examples/instruct_pix2pix/testset/he_generated/")
+translation_prompt = "Transform H&E-stained tissue, featuring pink cytoplasm and blue nuclei, into ER (IHC) stained tissue with brown ER-positive nuclei and light pink counterstained background."
+
+def genreateImages(pipe):
+    batch_size = 8
+    steps = 1000 // batch_size
+    for step in tqdm(range(steps), total=steps):
+        indices = list(range(step * batch_size, (step + 1) * batch_size))
+        batch = list(map(lambda l: PIL.Image.open(f"{dir_he}/{l:03d}.png"), indices))
+        tensor_batch = torch.stack([v2.ToTensor()(image) for image in batch])
+
+        ihc_generated = pipe([translation_prompt] * len(tensor_batch),
+            image=tensor_batch,
+            num_inference_steps=num_inference_steps,
+            image_guidance_scale=image_guidance_scale,
+            guidance_scale=guidance_scale,
+            generator=torch.Generator("cuda").manual_seed(0),
+        ).images
+
+        for batch_index, image in enumerate(ihc_generated):
+            file_index = step * batch_size + batch_index
+            image.save(f"{dir_genereated_ihc}/{file_index:03d}.png")
+
+
+def computeMetrics():
+    ssim_scores = []
+    psnr_scores = []
+    for index, path in tqdm(enumerate(dir_ihc.glob('*.png')), total=1000):
+        groundtruth = PIL.Image.open(path).convert("RGB")
+        generated = PIL.Image.open(str(path).replace("ihc", "ihc_generated")).convert("RGB")
+
+        ihcGeneratedCV = cv2.cvtColor(np.asarray(generated), cv2.COLOR_RGB2GRAY)
+        ihcGroundTruthCV = cv2.cvtColor(np.asarray(groundtruth), cv2.COLOR_RGB2GRAY)
+
+        ssimValue = ssim(ihcGroundTruthCV, ihcGeneratedCV)
+        psnrValue = cv2.PSNR(ihcGroundTruthCV, ihcGeneratedCV)
+
+        psnr_scores.append(psnrValue)
+        ssim_scores.append(ssimValue)
+        
+    fid_ihc = compute_fid(dir_ihc, dir_genereated_ihc)
+    
+    return statistics.mean(ssim_scores), statistics.mean(psnr_scores), fid_ihc
+
+def log_metrics(
+    pipeline,
+    accelerator
+):
+    pipeline = pipeline.to(accelerator.device)
+    autocast_ctx = torch.autocast(accelerator.device.type)
+
+    with autocast_ctx:
+        genreateImages(pipeline)
+        ssim_score, psnr_score, fid_ihc = computeMetrics()
+
+    for tracker in accelerator.trackers:
+        if tracker.name == "wandb":
+            tracker.log({"ssim": ssim_score, "psnr": psnr_score, "fid ihc": fid_ihc})
 
 
 def log_validation(
@@ -75,37 +143,45 @@ def log_validation(
 ):
     logger.info(
         f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
-        f" {args.validation_prompt}."
+        f" {args.translation_prompt}."
     )
-    pipeline = pipeline.to(accelerator.device)
+    pipeline = pipeline.to(accelerator.device)                    
     pipeline.set_progress_bar_config(disable=True)
+    
+    log_metrics(
+        pipeline,
+        accelerator
+    )
 
     # run inference
-    original_image = download_image(args.val_image_url)
-    edited_images = []
+    he_image = PIL.Image.open("val_image_he.jpg")
+    ihc_image = PIL.Image.open("val_image_ihc.jpg")
+    
+    translated_images = []
+    
     if torch.backends.mps.is_available():
         autocast_ctx = nullcontext()
     else:
         autocast_ctx = torch.autocast(accelerator.device.type)
 
     with autocast_ctx:
-        for _ in range(args.num_validation_images):
-            edited_images.append(
+        for i in range(args.num_validation_images):
+            translated_images.append(
                 pipeline(
-                    args.validation_prompt,
-                    image=original_image,
-                    num_inference_steps=20,
-                    image_guidance_scale=1.5,
-                    guidance_scale=7,
-                    generator=generator,
+                    args.translation_prompt,
+                    image=he_image,
+                    num_inference_steps=50,
+                    image_guidance_scale=0,
+                    guidance_scale=0,
+                    generator=torch.Generator(device=accelerator.device).manual_seed(i),
                 ).images[0]
             )
 
     for tracker in accelerator.trackers:
         if tracker.name == "wandb":
-            wandb_table = wandb.Table(columns=WANDB_TABLE_COL_NAMES)
-            for edited_image in edited_images:
-                wandb_table.add_data(wandb.Image(original_image), wandb.Image(edited_image), args.validation_prompt)
+            wandb_table = wandb.Table(columns=["he_groundtruth", "ihc_groundtruth", "translated", "edit_prompt"])
+            for translated_image in translated_images:
+                wandb_table.add_data(wandb.Image(he_image), wandb.Image(ihc_image), wandb.Image(translated_image), args.translation_prompt)
             tracker.log({"validation": wandb_table})
 
 
@@ -119,6 +195,24 @@ def parse_args():
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
+        "--project",
+        type=str,
+        default=None,
+        required=False,
+    )
+    parser.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        required=False,
+    )
+    parser.add_argument(
+        "--description",
+        type=str,
+        default=None,
+        required=False,
+    )
+    parser.add_argument(
         "--revision",
         type=str,
         default=None,
@@ -130,59 +224,6 @@ def parse_args():
         type=str,
         default=None,
         help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
-    )
-    parser.add_argument(
-        "--dataset_name",
-        type=str,
-        default=None,
-        help=(
-            "The name of the Dataset (from the HuggingFace hub) to train on (could be your own, possibly private,"
-            " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
-            " or to a folder containing files that 🤗 Datasets can understand."
-        ),
-    )
-    parser.add_argument(
-        "--dataset_config_name",
-        type=str,
-        default=None,
-        help="The config of the Dataset, leave as None if there's only one config.",
-    )
-    parser.add_argument(
-        "--train_data_dir",
-        type=str,
-        default=None,
-        help=(
-            "A folder containing the training data. Folder contents must follow the structure described in"
-            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
-            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
-        ),
-    )
-    parser.add_argument(
-        "--original_image_column",
-        type=str,
-        default="input_image",
-        help="The column of the dataset containing the original image on which edits where made.",
-    )
-    parser.add_argument(
-        "--edited_image_column",
-        type=str,
-        default="edited_image",
-        help="The column of the dataset containing the edited image.",
-    )
-    parser.add_argument(
-        "--edit_prompt_column",
-        type=str,
-        default="edit_prompt",
-        help="The column of the dataset containing the edit instruction.",
-    )
-    parser.add_argument(
-        "--val_image_url",
-        type=str,
-        default=None,
-        help="URL to the original image that you would like to edit (used during inference for debugging purposes).",
-    )
-    parser.add_argument(
-        "--validation_prompt", type=str, default=None, help="A prompt that is sampled during training for inference."
     )
     parser.add_argument(
         "--num_validation_images",
@@ -215,6 +256,12 @@ def parse_args():
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
+        "--translation_prompt",
+        type=str,
+        default="Transform H&E-stained tissue, featuring pink cytoplasm and blue nuclei, into ER (IHC) stained tissue with brown ER-positive nuclei and light pink counterstained background.",
+        help="The prompt used as text conditioning for i2i translation, will be the same for all batches",
+    )
+    parser.add_argument(
         "--cache_dir",
         type=str,
         default=None,
@@ -229,20 +276,6 @@ def parse_args():
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
         ),
-    )
-    parser.add_argument(
-        "--center_crop",
-        default=False,
-        action="store_true",
-        help=(
-            "Whether to center crop the input images to the resolution. If not set, the images will be randomly"
-            " cropped. The images will be resized to the resolution first before cropping."
-        ),
-    )
-    parser.add_argument(
-        "--random_flip",
-        action="store_true",
-        help="whether to randomly flip images horizontally",
     )
     parser.add_argument(
         "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
@@ -400,10 +433,6 @@ def parse_args():
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
-
-    # Sanity checks
-    if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError("Need either a dataset name or a training folder.")
 
     # default to using the same revision for the non-ema model if not specified
     if args.non_ema_revision is None:
@@ -615,60 +644,8 @@ def main():
         eps=args.adam_epsilon,
     )
 
-    # Get the datasets: you can either provide your own training and evaluation files (see below)
-    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
-
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-        )
-    else:
-        data_files = {}
-        if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "**")
-        dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=args.cache_dir,
-        )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/main/en/image_load#imagefolder
-
-    # Preprocessing the datasets.
-    # We need to tokenize inputs and targets.
-    column_names = dataset["train"].column_names
-
-    # 6. Get the column names for input/target.
-    dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
-    if args.original_image_column is None:
-        original_image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
-    else:
-        original_image_column = args.original_image_column
-        if original_image_column not in column_names:
-            raise ValueError(
-                f"--original_image_column' value '{args.original_image_column}' needs to be one of: {', '.join(column_names)}"
-            )
-    if args.edit_prompt_column is None:
-        edit_prompt_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
-    else:
-        edit_prompt_column = args.edit_prompt_column
-        if edit_prompt_column not in column_names:
-            raise ValueError(
-                f"--edit_prompt_column' value '{args.edit_prompt_column}' needs to be one of: {', '.join(column_names)}"
-            )
-    if args.edited_image_column is None:
-        edited_image_column = dataset_columns[2] if dataset_columns is not None else column_names[2]
-    else:
-        edited_image_column = args.edited_image_column
-        if edited_image_column not in column_names:
-            raise ValueError(
-                f"--edited_image_column' value '{args.edited_image_column}' needs to be one of: {', '.join(column_names)}"
-            )
+    from MISTDataset import mist_ds
+    dataset = mist_ds
 
     # Preprocessing the datasets.
     # We need to tokenize input captions and transform the images.
@@ -681,21 +658,22 @@ def main():
     # Preprocessing the datasets.
     train_transforms = transforms.Compose(
         [
-            transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
-            transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
+            transforms.RandomCrop(args.resolution),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip()
         ]
     )
 
     def preprocess_images(examples):
-        original_images = np.concatenate(
-            [convert_to_np(image, args.resolution) for image in examples[original_image_column]]
+        he_images = np.concatenate(
+            [convert_to_np(image, args.resolution) for image in examples["he_image"]]
         )
-        edited_images = np.concatenate(
-            [convert_to_np(image, args.resolution) for image in examples[edited_image_column]]
+        ihc_images = np.concatenate(
+            [convert_to_np(image, args.resolution) for image in examples["ihc_image"]]
         )
         # We need to ensure that the original and the edited images undergo the same
         # augmentation transforms.
-        images = np.concatenate([original_images, edited_images])
+        images = np.concatenate([he_images, ihc_images])
         images = torch.tensor(images)
         images = 2 * (images / 255) - 1
         return train_transforms(images)
@@ -706,35 +684,35 @@ def main():
         # Since the original and edited images were concatenated before
         # applying the transformations, we need to separate them and reshape
         # them accordingly.
-        original_images, edited_images = preprocessed_images.chunk(2)
-        original_images = original_images.reshape(-1, 3, args.resolution, args.resolution)
-        edited_images = edited_images.reshape(-1, 3, args.resolution, args.resolution)
+        he_images, ihc_images = preprocessed_images.chunk(2)
+        he_images = he_images.reshape(-1, 3, args.resolution, args.resolution)
+        ihc_images = ihc_images.reshape(-1, 3, args.resolution, args.resolution)
 
         # Collate the preprocessed images into the `examples`.
-        examples["original_pixel_values"] = original_images
-        examples["edited_pixel_values"] = edited_images
+        examples["he_images"] = he_images
+        examples["ihc_images"] = ihc_images
 
-        # Preprocess the captions.
-        captions = list(examples[edit_prompt_column])
-        examples["input_ids"] = tokenize_captions(captions)
         return examples
 
     with accelerator.main_process_first():
         if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+            dataset = dataset.shuffle(seed=args.seed).select(range(args.max_train_samples))
         # Set the training transforms
-        train_dataset = dataset["train"].with_transform(preprocess_train)
+        train_dataset = dataset.with_transform(preprocess_train)
+        
+        # tokenize translation prompt once, which is the same for all batches
+        translation_prompt = tokenize_captions([args.translation_prompt] * args.train_batch_size)
+        translation_prompt = text_encoder(translation_prompt)[0].to(accelerator.device)
+        
 
     def collate_fn(examples):
-        original_pixel_values = torch.stack([example["original_pixel_values"] for example in examples])
-        original_pixel_values = original_pixel_values.to(memory_format=torch.contiguous_format).float()
-        edited_pixel_values = torch.stack([example["edited_pixel_values"] for example in examples])
-        edited_pixel_values = edited_pixel_values.to(memory_format=torch.contiguous_format).float()
-        input_ids = torch.stack([example["input_ids"] for example in examples])
+        he_pixel_values = torch.stack([example["he_images"] for example in examples])
+        he_pixel_values = he_pixel_values.to(memory_format=torch.contiguous_format).float()
+        ihc_pixel_values = torch.stack([example["ihc_images"] for example in examples])
+        ihc_pixel_values = ihc_pixel_values.to(memory_format=torch.contiguous_format).float()
         return {
-            "original_pixel_values": original_pixel_values,
-            "edited_pixel_values": edited_pixel_values,
-            "input_ids": input_ids,
+            "he_pixel_values": he_pixel_values,
+            "ihc_pixel_values": ihc_pixel_values
         }
 
     # DataLoaders creation:
@@ -801,7 +779,7 @@ def main():
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers("instruct-pix2pix", config=vars(args))
+        accelerator.init_trackers(args.project, config=vars(args), init_kwargs={"wandb": {"name": args.name, "notes": args.description}})
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -844,10 +822,43 @@ def main():
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
+    
+    if args.use_ema:
+        # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+        ema_unet.store(unet.parameters())
+        ema_unet.copy_to(unet.parameters())
+    # The models need unwrapping because for compatibility in distributed training mode.
+    pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        unet=unwrap_model(unet),
+        text_encoder=unwrap_model(text_encoder),
+        vae=unwrap_model(vae),
+        revision=args.revision,
+        variant=args.variant,
+        torch_dtype=weight_dtype,
+        safety_checker = None,
+        requires_safety_checker = False
+    )
+    
+
+    log_validation(
+        pipeline,
+        args,
+        accelerator,
+        generator,
+    )
+
+    if args.use_ema:
+        # Switch back to the original UNet parameters.
+        ema_unet.restore(unet.parameters())
+
+    del pipeline
+    torch.cuda.empty_cache()
 
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         train_loss = 0.0
+        epoch_mse_losses = []
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
@@ -859,69 +870,68 @@ def main():
                 # We want to learn the denoising process w.r.t the edited images which
                 # are conditioned on the original image (which was edited) and the edit instruction.
                 # So, first, convert images to latent space.
-                latents = vae.encode(batch["edited_pixel_values"].to(weight_dtype)).latent_dist.sample()
-                latents = latents * vae.config.scaling_factor
+                ihc_latents = vae.encode(batch["ihc_pixel_values"].to(weight_dtype)).latent_dist.sample()
+                ihc_latents = ihc_latents * vae.config.scaling_factor
 
                 # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                bsz = latents.shape[0]
+                noise = torch.randn_like(ihc_latents)
+                offset_noise = 0.1 * torch.randn(ihc_latents.shape[0], ihc_latents.shape[1], 1, 1).to("cuda")
+                noise += offset_noise
+                bsz = ihc_latents.shape[0]
                 # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=ihc_latents.device)
                 timesteps = timesteps.long()
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-                # Get the text embedding for conditioning.
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                noisy_latents = noise_scheduler.add_noise(ihc_latents, noise, timesteps)
 
                 # Get the additional image embedding for conditioning.
                 # Instead of getting a diagonal Gaussian here, we simply take the mode.
-                original_image_embeds = vae.encode(batch["original_pixel_values"].to(weight_dtype)).latent_dist.mode()
+                he_image_embeds = vae.encode(batch["he_pixel_values"].to(weight_dtype)).latent_dist.mode()
 
                 # Conditioning dropout to support classifier-free guidance during inference. For more details
                 # check out the section 3.2.1 of the original paper https://arxiv.org/abs/2211.09800.
                 if args.conditioning_dropout_prob is not None:
-                    random_p = torch.rand(bsz, device=latents.device, generator=generator)
+                    random_p = torch.rand(bsz, device=ihc_latents.device, generator=generator)
                     # Sample masks for the edit prompts.
                     prompt_mask = random_p < 2 * args.conditioning_dropout_prob
                     prompt_mask = prompt_mask.reshape(bsz, 1, 1)
                     # Final text conditioning.
                     null_conditioning = text_encoder(tokenize_captions([""]).to(accelerator.device))[0]
-                    encoder_hidden_states = torch.where(prompt_mask, null_conditioning, encoder_hidden_states)
+                    translation_prompt = torch.where(prompt_mask, null_conditioning, translation_prompt)
 
                     # Sample masks for the original images.
-                    image_mask_dtype = original_image_embeds.dtype
+                    image_mask_dtype = he_image_embeds.dtype
                     image_mask = 1 - (
                         (random_p >= args.conditioning_dropout_prob).to(image_mask_dtype)
                         * (random_p < 3 * args.conditioning_dropout_prob).to(image_mask_dtype)
                     )
                     image_mask = image_mask.reshape(bsz, 1, 1, 1)
                     # Final image conditioning.
-                    original_image_embeds = image_mask * original_image_embeds
+                    he_image_embeds = image_mask * he_image_embeds
 
                 # Concatenate the `original_image_embeds` with the `noisy_latents`.
-                concatenated_noisy_latents = torch.cat([noisy_latents, original_image_embeds], dim=1)
+                concatenated_noisy_latents = torch.cat([noisy_latents, he_image_embeds], dim=1)
 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
                 elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                    target = noise_scheduler.get_velocity(ihc_latents, noise, timesteps)
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
                 # Predict the noise residual and compute loss
-                model_pred = unet(concatenated_noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-
+                model_pred = unet(concatenated_noisy_latents, timesteps, translation_prompt, return_dict=False)[0]
+                mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                epoch_mse_losses.append(mse_loss.item())
                 # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+                avg_loss = accelerator.gather(mse_loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
                 # Backpropagate
-                accelerator.backward(loss)
+                accelerator.backward(mse_loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
                 optimizer.step()
@@ -963,16 +973,18 @@ def main():
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"step_loss": mse_loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
                 break
 
+        # EPOCH Finished
         if accelerator.is_main_process:
+            accelerator.log({"epoch_mse_losses": statistics.mean(epoch_mse_losses)}, step=global_step)
+
             if (
                 (args.val_image_url is not None)
-                and (args.validation_prompt is not None)
                 and (epoch % args.validation_epochs == 0)
             ):
                 if args.use_ema:
@@ -988,7 +1000,10 @@ def main():
                     revision=args.revision,
                     variant=args.variant,
                     torch_dtype=weight_dtype,
+                    safety_checker = None,
+                    requires_safety_checker = False
                 )
+                
 
                 log_validation(
                     pipeline,
@@ -1017,6 +1032,8 @@ def main():
             unet=unwrap_model(unet),
             revision=args.revision,
             variant=args.variant,
+            safety_checker = None,
+            requires_safety_checker = False
         )
         pipeline.save_pretrained(args.output_dir)
 
@@ -1028,13 +1045,12 @@ def main():
                 ignore_patterns=["step_*", "epoch_*"],
             )
 
-        if (args.val_image_url is not None) and (args.validation_prompt is not None):
-            log_validation(
-                pipeline,
-                args,
-                accelerator,
-                generator,
-            )
+        log_validation(
+            pipeline,
+            args,
+            accelerator,
+            generator,
+        )
     accelerator.end_training()
 
 
