@@ -843,7 +843,7 @@ def main():
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         train_loss = 0.0
-        epoch_mae_losses = []
+        epoch_mse_losses = []
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
@@ -909,14 +909,14 @@ def main():
 
                 # Predict the noise residual and compute loss
                 model_pred = unet(concatenated_noisy_latents, timesteps, translation_prompt, return_dict=False)[0]
-                mae_loss = F.l1_loss(model_pred.float(), target.float(), reduction="mean")
-                epoch_mae_losses.append(mae_loss.item())
+                mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                epoch_mse_losses.append(mse_loss.item())
                 # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(mae_loss.repeat(args.train_batch_size)).mean()
+                avg_loss = accelerator.gather(mse_loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
                 # Backpropagate
-                accelerator.backward(mae_loss)
+                accelerator.backward(mse_loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
                 optimizer.step()
@@ -958,7 +958,7 @@ def main():
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-            logs = {"step_loss": mae_loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"step_loss": mse_loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
@@ -966,7 +966,7 @@ def main():
 
         # EPOCH Finished
         if accelerator.is_main_process:
-            accelerator.log({"epoch_mae_losses": statistics.mean(epoch_mae_losses)}, step=global_step)
+            accelerator.log({"epoch_mse_losses": statistics.mean(epoch_mse_losses)}, step=global_step)
 
             if (epoch % args.validation_epochs == 0):
                 if args.use_ema:
