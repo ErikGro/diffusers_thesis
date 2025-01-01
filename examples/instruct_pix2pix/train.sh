@@ -1,10 +1,10 @@
 MODEL_NAME="botp/stable-diffusion-v1-5"
 PROJECT_NAME="Thesis InstructPix2Pix"
-RUN_TITLE="25_01_01 Vanilla MAE + Offset Noise"
-RUN_DESCRIPTION="Offset noise and MAE"
+RUN_TITLE="25_01_01 Vanilla MSE + Offset Noise"
+RUN_DESCRIPTION="Offset noise and MSE"
 OUTPUT_DIR="${RUN_TITLE// /_}"
 
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=0
 export NCCL_P2P_DISABLE="1"
 export NCCL_IB_DISABLE="1"
 
@@ -16,7 +16,7 @@ nohup accelerate launch --gpu_ids $CUDA_VISIBLE_DEVICES train_instruct_pix2pix.p
     --pretrained_model_name_or_path=$MODEL_NAME \
     --train_batch_size=16 \
     --learning_rate=1e-4\
-    --num_train_epochs=300 \
+    --num_train_epochs=550 \
     --mixed_precision="bf16" \
     --resolution=512 \
     --translation_prompt="Transform H&E-stained tissue, featuring pink cytoplasm and blue nuclei, into ER (IHC) stained tissue with brown ER-positive nuclei and light pink counterstained background." \
