@@ -72,10 +72,9 @@ num_inference_steps = 10
 image_guidance_scale = 0
 guidance_scale = 0
 inference_batch_size = 8
-dir_he = Path("/graphics/scratch2/students/grosskop/diffusers/examples/instruct_pix2pix/testset/he/")
-dir_ihc = Path("/graphics/scratch2/students/grosskop/diffusers/examples/instruct_pix2pix/testset/ihc")
-dir_genereated_ihc = Path("/graphics/scratch2/students/grosskop/diffusers_thesis/examples/instruct_pix2pix/testset/ihc_generated/")
-dir_genereated_he = Path("/graphics/scratch2/students/grosskop/diffusers_thesis/examples/instruct_pix2pix/testset/he_generated/")
+dir_he = Path("/graphics/scratch2/students/grosskop/benchmark_er_testset/valA/")
+dir_ihc_target = Path("/graphics/scratch2/students/grosskop/benchmark_er_testset/valB")
+dir_ihc_genereated = Path("./testset/ihc_generated/")
 translation_prompt = "Transform H&E-stained tissue, featuring pink cytoplasm and blue nuclei, into ER (IHC) stained tissue with brown ER-positive nuclei and light pink counterstained background."
 
 def genreateImages(pipe):
@@ -96,13 +95,13 @@ def genreateImages(pipe):
 
         for batch_index, image in enumerate(ihc_generated):
             file_index = step * batch_size + batch_index
-            image.save(f"{dir_genereated_ihc}/{file_index:03d}.png")
+            image.save(f"{dir_ihc_genereated}/{file_index:03d}.png")
 
 
 def computeMetrics():
     ssim_scores = []
     psnr_scores = []
-    for index, path in tqdm(enumerate(dir_ihc.glob('*.png')), total=1000):
+    for index, path in tqdm(enumerate(dir_ihc_target.glob('*.png')), total=1000):
         groundtruth = PIL.Image.open(path).convert("RGB")
         generated = PIL.Image.open(str(path).replace("ihc", "ihc_generated")).convert("RGB")
 
@@ -115,24 +114,9 @@ def computeMetrics():
         psnr_scores.append(psnrValue)
         ssim_scores.append(ssimValue)
         
-    fid_ihc = compute_fid(dir_ihc, dir_genereated_ihc)
+    fid_ihc = compute_fid(dir_ihc_target, dir_ihc_genereated)
     
     return statistics.mean(ssim_scores), statistics.mean(psnr_scores), fid_ihc
-
-def log_metrics(
-    pipeline,
-    accelerator
-):
-    pipeline = pipeline.to(accelerator.device)
-    autocast_ctx = torch.autocast(accelerator.device.type)
-
-    with autocast_ctx:
-        genreateImages(pipeline)
-        ssim_score, psnr_score, fid_ihc = computeMetrics()
-
-    for tracker in accelerator.trackers:
-        if tracker.name == "wandb":
-            tracker.log({"ssim": ssim_score, "psnr": psnr_score, "fid ihc": fid_ihc})
 
 
 def log_validation(
@@ -148,23 +132,17 @@ def log_validation(
     pipeline = pipeline.to(accelerator.device)                    
     pipeline.set_progress_bar_config(disable=True)
     
-    log_metrics(
-        pipeline,
-        accelerator
-    )
-
-    # run inference
-    he_image = PIL.Image.open("val_image_he.jpg")
-    ihc_image = PIL.Image.open("val_image_ihc.jpg")
-    
-    translated_images = []
-    
     if torch.backends.mps.is_available():
         autocast_ctx = nullcontext()
     else:
         autocast_ctx = torch.autocast(accelerator.device.type)
 
+    translated_images = []
     with autocast_ctx:
+        genreateImages(pipeline)
+        ssim_score, psnr_score, fid_ihc = computeMetrics()
+        
+        he_image = PIL.Image.open("val_image_he.jpg")
         for i in range(args.num_validation_images):
             translated_images.append(
                 pipeline(
@@ -179,10 +157,17 @@ def log_validation(
 
     for tracker in accelerator.trackers:
         if tracker.name == "wandb":
-            wandb_table = wandb.Table(columns=["he_groundtruth", "ihc_groundtruth", "translated", "edit_prompt"])
-            for translated_image in translated_images:
-                wandb_table.add_data(wandb.Image(he_image), wandb.Image(ihc_image), wandb.Image(translated_image), args.translation_prompt)
-            tracker.log({"validation": wandb_table})
+            tracker.log(
+                {
+                    "validation": [
+                        wandb.Image(image, caption="002.jpg pred")
+                        for i, image in enumerate(translated_images)
+                    ],
+                    "ssim": ssim_score, 
+                    "psnr": psnr_score, 
+                    "fid ihc": fid_ihc
+                }
+            )
 
 
 def parse_args():
@@ -858,7 +843,7 @@ def main():
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         train_loss = 0.0
-        epoch_mse_losses = []
+        epoch_mae_losses = []
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
@@ -924,14 +909,14 @@ def main():
 
                 # Predict the noise residual and compute loss
                 model_pred = unet(concatenated_noisy_latents, timesteps, translation_prompt, return_dict=False)[0]
-                mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                epoch_mse_losses.append(mse_loss.item())
+                mae_loss = F.l1_loss(model_pred.float(), target.float(), reduction="mean")
+                epoch_mae_losses.append(mae_loss.item())
                 # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(mse_loss.repeat(args.train_batch_size)).mean()
+                avg_loss = accelerator.gather(mae_loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
                 # Backpropagate
-                accelerator.backward(mse_loss)
+                accelerator.backward(mae_loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
                 optimizer.step()
@@ -973,7 +958,7 @@ def main():
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-            logs = {"step_loss": mse_loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"step_loss": mae_loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
@@ -981,12 +966,9 @@ def main():
 
         # EPOCH Finished
         if accelerator.is_main_process:
-            accelerator.log({"epoch_mse_losses": statistics.mean(epoch_mse_losses)}, step=global_step)
+            accelerator.log({"epoch_mae_losses": statistics.mean(epoch_mae_losses)}, step=global_step)
 
-            if (
-                (args.val_image_url is not None)
-                and (epoch % args.validation_epochs == 0)
-            ):
+            if (epoch % args.validation_epochs == 0):
                 if args.use_ema:
                     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                     ema_unet.store(unet.parameters())

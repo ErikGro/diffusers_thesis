@@ -1,10 +1,10 @@
 MODEL_NAME="botp/stable-diffusion-v1-5"
-PROJECT_NAME="New Instruct Pix2Pix"
-RUN_TITLE="24_12_31 Vanilla MSE + Offset Noise"
-RUN_DESCRIPTION="This is the vanilla Instruct Pix2Pix config which should server as a benchmark"
+PROJECT_NAME="Thesis: InstructPix2Pix"
+RUN_TITLE="25_01_01 Vanilla MAE + Offset Noise"
+RUN_DESCRIPTION="Offset noise and MAE"
 OUTPUT_DIR="${RUN_TITLE// /_}"
 
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=2
 export NCCL_P2P_DISABLE="1"
 export NCCL_IB_DISABLE="1"
 
@@ -24,6 +24,6 @@ nohup accelerate launch --gpu_ids $CUDA_VISIBLE_DEVICES train_instruct_pix2pix.p
     --enable_xformers_memory_efficient_attention \
     --seed=0 \
     --report_to="wandb" \
-    --checkpointing_steps=2000 \
+    --checkpointing_steps=10000 \
     --checkpoints_total_limit=4 \
     > $OUTPUT_DIR.log 2>&1 &
