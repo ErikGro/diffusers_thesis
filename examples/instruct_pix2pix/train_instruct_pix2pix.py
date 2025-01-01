@@ -68,108 +68,6 @@ check_min_version("0.32.1")
 
 logger = get_logger(__name__, log_level="INFO")
 
-num_inference_steps = 10
-image_guidance_scale = 0
-guidance_scale = 0
-inference_batch_size = 8
-dir_he = Path("/graphics/scratch2/students/grosskop/benchmark_er_testset/valA/")
-dir_ihc_target = Path("/graphics/scratch2/students/grosskop/benchmark_er_testset/valB")
-dir_ihc_genereated = Path("./testset/ihc_generated/")
-translation_prompt = "Transform H&E-stained tissue, featuring pink cytoplasm and blue nuclei, into ER (IHC) stained tissue with brown ER-positive nuclei and light pink counterstained background."
-
-def genreateImages(pipe):
-    batch_size = 8
-    steps = 1000 // batch_size
-    for step in tqdm(range(steps), total=steps):
-        indices = list(range(step * batch_size, (step + 1) * batch_size))
-        batch = list(map(lambda l: PIL.Image.open(f"{dir_he}/{l:03d}.png"), indices))
-        tensor_batch = torch.stack([v2.ToTensor()(image) for image in batch])
-
-        ihc_generated = pipe([translation_prompt] * len(tensor_batch),
-            image=tensor_batch,
-            num_inference_steps=num_inference_steps,
-            image_guidance_scale=image_guidance_scale,
-            guidance_scale=guidance_scale,
-            generator=torch.Generator("cuda").manual_seed(0),
-        ).images
-
-        for batch_index, image in enumerate(ihc_generated):
-            file_index = step * batch_size + batch_index
-            image.save(f"{dir_ihc_genereated}/{file_index:03d}.png")
-
-
-def computeMetrics():
-    ssim_scores = []
-    psnr_scores = []
-    for index, path in tqdm(enumerate(dir_ihc_target.glob('*.png')), total=1000):
-        groundtruth = PIL.Image.open(path).convert("RGB")
-        generated = PIL.Image.open(str(path).replace("ihc", "ihc_generated")).convert("RGB")
-
-        ihcGeneratedCV = cv2.cvtColor(np.asarray(generated), cv2.COLOR_RGB2GRAY)
-        ihcGroundTruthCV = cv2.cvtColor(np.asarray(groundtruth), cv2.COLOR_RGB2GRAY)
-
-        ssimValue = ssim(ihcGroundTruthCV, ihcGeneratedCV)
-        psnrValue = cv2.PSNR(ihcGroundTruthCV, ihcGeneratedCV)
-
-        psnr_scores.append(psnrValue)
-        ssim_scores.append(ssimValue)
-        
-    fid_ihc = compute_fid(dir_ihc_target, dir_ihc_genereated)
-    
-    return statistics.mean(ssim_scores), statistics.mean(psnr_scores), fid_ihc
-
-
-def log_validation(
-    pipeline,
-    args,
-    accelerator,
-    generator,
-):
-    logger.info(
-        f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
-        f" {args.translation_prompt}."
-    )
-    pipeline = pipeline.to(accelerator.device)                    
-    pipeline.set_progress_bar_config(disable=True)
-    
-    if torch.backends.mps.is_available():
-        autocast_ctx = nullcontext()
-    else:
-        autocast_ctx = torch.autocast(accelerator.device.type)
-
-    translated_images = []
-    with autocast_ctx:
-        genreateImages(pipeline)
-        ssim_score, psnr_score, fid_ihc = computeMetrics()
-        
-        he_image = PIL.Image.open("val_image_he.jpg")
-        for i in range(args.num_validation_images):
-            translated_images.append(
-                pipeline(
-                    args.translation_prompt,
-                    image=he_image,
-                    num_inference_steps=50,
-                    image_guidance_scale=0,
-                    guidance_scale=0,
-                    generator=torch.Generator(device=accelerator.device).manual_seed(i),
-                ).images[0]
-            )
-
-    for tracker in accelerator.trackers:
-        if tracker.name == "wandb":
-            tracker.log(
-                {
-                    "validation": [
-                        wandb.Image(image, caption="002.jpg pred")
-                        for i, image in enumerate(translated_images)
-                    ],
-                    "ssim": ssim_score, 
-                    "psnr": psnr_score, 
-                    "fid ihc": fid_ihc
-                }
-            )
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script for InstructPix2Pix.")
     parser.add_argument(
@@ -440,6 +338,7 @@ def download_image(url):
 
 def main():
     args = parse_args()
+
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError(
             "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
@@ -463,6 +362,107 @@ def main():
         log_with=args.report_to,
         project_config=accelerator_project_config,
     )
+    
+    # Logging 
+    num_inference_steps = 50
+    image_guidance_scale = 0
+    guidance_scale = 0
+    inference_batch_size = 8
+    dir_he = Path("/graphics/scratch2/students/grosskop/benchmark_er_testset/valA/")
+    dir_ihc_target = Path("/graphics/scratch2/students/grosskop/benchmark_er_testset/valB")
+    dir_ihc_genereated = os.path.join(args.output_dir, "generated")
+    os.makedirs(dir_ihc_genereated, exist_ok=True)
+
+    def genreateImages(pipe):
+        steps = 1000 // inference_batch_size
+        for step in tqdm(range(steps), total=steps):
+            indices = list(range(step * inference_batch_size, (step + 1) * inference_batch_size))
+            batch = list(map(lambda l: PIL.Image.open(f"{dir_he}/{l:03d}.jpg"), indices))
+            tensor_batch = torch.stack([v2.ToTensor()(image) for image in batch])
+
+            ihc_generated = pipe([args.translation_prompt] * len(tensor_batch),
+                image=tensor_batch,
+                num_inference_steps=num_inference_steps,
+                image_guidance_scale=image_guidance_scale,
+                guidance_scale=guidance_scale,
+                generator=torch.Generator("cuda").manual_seed(0),
+            ).images
+
+            for batch_index, image in enumerate(ihc_generated):
+                file_index = step * inference_batch_size + batch_index
+                image.save(f"{dir_ihc_genereated}/{file_index:03d}.jpg")
+
+
+    def computeMetrics():
+        ssim_scores = []
+        psnr_scores = []
+        for index, path in tqdm(enumerate(dir_ihc_target.glob('*.jpg')), total=1000):
+            groundtruth = PIL.Image.open(path).convert("RGB")
+            generated = PIL.Image.open(str(os.path.join(dir_ihc_genereated, path.name))).convert("RGB")
+
+            ihcGeneratedCV = cv2.cvtColor(np.asarray(generated), cv2.COLOR_RGB2GRAY)
+            ihcGroundTruthCV = cv2.cvtColor(np.asarray(groundtruth), cv2.COLOR_RGB2GRAY)
+
+            ssimValue = ssim(ihcGroundTruthCV, ihcGeneratedCV)
+            psnrValue = cv2.PSNR(ihcGroundTruthCV, ihcGeneratedCV)
+
+            psnr_scores.append(psnrValue)
+            ssim_scores.append(ssimValue)
+            
+        fid_ihc = compute_fid(dir_ihc_target, dir_ihc_genereated)
+        
+        return statistics.mean(ssim_scores), statistics.mean(psnr_scores), fid_ihc
+
+
+    def log_validation(
+        pipeline,
+        args,
+        accelerator,
+        generator,
+    ):
+        logger.info(
+            f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
+            f" {args.translation_prompt}."
+        )
+        pipeline = pipeline.to(accelerator.device)                    
+        pipeline.set_progress_bar_config(disable=True)
+        
+        if torch.backends.mps.is_available():
+            autocast_ctx = nullcontext()
+        else:
+            autocast_ctx = torch.autocast(accelerator.device.type)
+
+        translated_images = []
+        with autocast_ctx:
+            genreateImages(pipeline)
+            ssim_score, psnr_score, fid_ihc = computeMetrics()
+            
+            he_image = PIL.Image.open("val_image_he.jpg")
+            for i in range(args.num_validation_images):
+                translated_images.append(
+                    pipeline(
+                        args.translation_prompt,
+                        image=he_image,
+                        num_inference_steps=50,
+                        image_guidance_scale=0,
+                        guidance_scale=0,
+                        generator=torch.Generator(device=accelerator.device).manual_seed(i),
+                    ).images[0]
+                )
+
+        for tracker in accelerator.trackers:
+            if tracker.name == "wandb":
+                tracker.log(
+                    {
+                        "validation": [
+                            wandb.Image(image, caption="002.jpg pred")
+                            for i, image in enumerate(translated_images)
+                        ],
+                        "ssim": ssim_score, 
+                        "psnr": psnr_score, 
+                        "fid ihc": fid_ihc
+                    }
+                )
 
     # Disable AMP for MPS.
     if torch.backends.mps.is_available():
@@ -803,10 +803,6 @@ def main():
             resume_global_step = global_step * args.gradient_accumulation_steps
             first_epoch = global_step // num_update_steps_per_epoch
             resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
-
-    # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
-    progress_bar.set_description("Steps")
     
     if args.use_ema:
         # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
@@ -839,11 +835,15 @@ def main():
 
     del pipeline
     torch.cuda.empty_cache()
+    
+    # Only show the progress bar once on each machine.
+    progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar.set_description("Steps")
 
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         train_loss = 0.0
-        epoch_mse_losses = []
+        epoch_mae_losses = []
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
@@ -909,14 +909,14 @@ def main():
 
                 # Predict the noise residual and compute loss
                 model_pred = unet(concatenated_noisy_latents, timesteps, translation_prompt, return_dict=False)[0]
-                mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                epoch_mse_losses.append(mse_loss.item())
+                mae_loss = F.l1_loss(model_pred.float(), target.float(), reduction="mean")
+                epoch_mae_losses.append(mae_loss.item())
                 # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(mse_loss.repeat(args.train_batch_size)).mean()
+                avg_loss = accelerator.gather(mae_loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
                 # Backpropagate
-                accelerator.backward(mse_loss)
+                accelerator.backward(mae_loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
                 optimizer.step()
@@ -958,7 +958,7 @@ def main():
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-            logs = {"step_loss": mse_loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"step_loss": mae_loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
@@ -966,7 +966,7 @@ def main():
 
         # EPOCH Finished
         if accelerator.is_main_process:
-            accelerator.log({"epoch_mse_losses": statistics.mean(epoch_mse_losses)}, step=global_step)
+            accelerator.log({"epoch_mae_losses": statistics.mean(epoch_mae_losses)}, step=global_step)
 
             if (epoch % args.validation_epochs == 0):
                 if args.use_ema:
