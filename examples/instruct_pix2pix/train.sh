@@ -1,7 +1,7 @@
 MODEL_NAME="botp/stable-diffusion-v1-5"
 PROJECT_NAME="Thesis InstructPix2Pix"
-RUN_TITLE="25_01_01 Vanilla MAE + Offset Noise"
-RUN_DESCRIPTION="Offset noise and MAE"
+RUN_TITLE="25_01_02 MSE + Offset Noise"
+RUN_DESCRIPTION="Vanilla MSE + Offset Noise"
 OUTPUT_DIR="${RUN_TITLE// /_}"
 
 export CUDA_VISIBLE_DEVICES=2
