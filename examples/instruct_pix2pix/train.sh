@@ -1,10 +1,10 @@
 MODEL_NAME="botp/stable-diffusion-v1-5"
 PROJECT_NAME="Thesis InstructPix2Pix"
-RUN_TITLE="25_01_01 Vanilla MSE + Offset Noise"
-RUN_DESCRIPTION="Offset noise and MSE"
+RUN_TITLE="25_01_01 Vanilla MAE + Offset Noise"
+RUN_DESCRIPTION="Offset noise and MAE"
 OUTPUT_DIR="${RUN_TITLE// /_}"
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=2
 export NCCL_P2P_DISABLE="1"
 export NCCL_IB_DISABLE="1"
 
@@ -27,3 +27,4 @@ nohup accelerate launch --gpu_ids $CUDA_VISIBLE_DEVICES train_instruct_pix2pix.p
     --checkpointing_steps=10000 \
     --checkpoints_total_limit=4 \
     > $OUTPUT_DIR.log 2>&1 &
+    

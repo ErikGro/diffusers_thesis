@@ -325,8 +325,8 @@ def parse_args():
     return args
 
 
-def convert_to_np(image, resolution):
-    image = image.convert("RGB").resize((resolution, resolution))
+def convert_to_np(image):
+    image = image.convert("RGB")
     return np.array(image).transpose(2, 0, 1)
 
 
@@ -646,17 +646,17 @@ def main():
         [
             transforms.RandomCrop(args.resolution),
             transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(),
+            transforms.RandomVerticalFlip(), # This is unnecessary
             transforms.Lambda(lambda x: transforms.functional.rotate(x, angle=random.choice([0, 90, 180, 270])))
         ]
     )
 
     def preprocess_images(examples):
         he_images = np.concatenate(
-            [convert_to_np(image, args.resolution) for image in examples["he_image"]]
+            [convert_to_np(image) for image in examples["he_image"]]
         )
         ihc_images = np.concatenate(
-            [convert_to_np(image, args.resolution) for image in examples["ihc_image"]]
+            [convert_to_np(image) for image in examples["ihc_image"]]
         )
         # We need to ensure that the original and the edited images undergo the same
         # augmentation transforms.
@@ -845,7 +845,7 @@ def main():
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         train_loss = 0.0
-        epoch_mse_losses = []
+        epoch_mae_losses = []
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
@@ -911,14 +911,14 @@ def main():
 
                 # Predict the noise residual and compute loss
                 model_pred = unet(concatenated_noisy_latents, timesteps, translation_prompt, return_dict=False)[0]
-                mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                epoch_mse_losses.append(mse_loss.item())
+                mae_loss = F.l1_loss(model_pred.float(), target.float(), reduction="mean")
+                epoch_mae_losses.append(mae_loss.item())
                 # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(mse_loss.repeat(args.train_batch_size)).mean()
+                avg_loss = accelerator.gather(mae_loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
                 # Backpropagate
-                accelerator.backward(mse_loss)
+                accelerator.backward(mae_loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
                 optimizer.step()
@@ -960,7 +960,7 @@ def main():
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-            logs = {"step_loss": mse_loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"step_loss": mae_loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
@@ -968,7 +968,7 @@ def main():
 
         # EPOCH Finished
         if accelerator.is_main_process:
-            accelerator.log({"epoch_mse_losses": statistics.mean(epoch_mse_losses)}, step=global_step)
+            accelerator.log({"train_loss_epoch": statistics.mean(epoch_mae_losses)}, step=global_step)
 
             if (epoch % args.validation_epochs == 0):
                 if args.use_ema:
