@@ -1,7 +1,7 @@
-MODEL_NAME="botp/stable-diffusion-v1-5"
+MODEL_NAME="/graphics/scratch2/students/grosskop/diffusers/examples/instruct_pix2pix/output_08_13_addNoise"
 PROJECT_NAME="Thesis ControlNet + InstructPix2Pix"
-RUN_TITLE="25_01_04 Canny Edges"
-RUN_DESCRIPTION="ControlNet of finetuned InstructPix2Pix using Canny Edges loss"
+RUN_TITLE="25_01_04 Canny Edges Loss"
+RUN_DESCRIPTION="ControlNet of finetuned InstructPix2Pix using H&E Image as input to frozen network and Canny Edges of H&E and H&E Lantes to ControlNet and Canny Edges loss between predicted image and H&E Input Image"
 OUTPUT_DIR="${RUN_TITLE// /_}"
 
 export CUDA_VISIBLE_DEVICES=1
@@ -14,7 +14,7 @@ nohup accelerate launch --gpu_ids $CUDA_VISIBLE_DEVICES train_controlnet.py \
     --name="$RUN_TITLE" \
     --description="$RUN_DESCRIPTION" \
     --pretrained_model_name_or_path=$MODEL_NAME \
-    --train_batch_size=16 \
+    --train_batch_size=4 \
     --learning_rate=5e-6 \
     --num_train_epochs=100 \
     --mixed_precision="bf16" \
@@ -24,7 +24,7 @@ nohup accelerate launch --gpu_ids $CUDA_VISIBLE_DEVICES train_controlnet.py \
     --enable_xformers_memory_efficient_attention \
     --seed=0 \
     --report_to="wandb" \
-    --checkpointing_steps=10000 \
+    --checkpointing_steps=2000 \
     --checkpoints_total_limit=4 \
     > $OUTPUT_DIR.log 2>&1 &
     
