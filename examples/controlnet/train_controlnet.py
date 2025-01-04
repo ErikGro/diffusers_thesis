@@ -22,12 +22,16 @@ import os
 import random
 import shutil
 from pathlib import Path
+import statistics
+import cv2
+import PIL
 
 import accelerate
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
+import torchvision
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -39,6 +43,12 @@ from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
+import torch.nn as nn
+import sys
+sys.path.append("/graphics/scratch2/students/grosskop/AdaptiveSupervisedPatchNCE/")
+from evaluate import compute_fid
+from skimage.metrics import structural_similarity as ssim
+from torchvision.transforms import v2
 
 import diffusers
 from diffusers import (
@@ -63,129 +73,6 @@ if is_wandb_available():
 # check_min_version("0.33.0.dev0")
 
 logger = get_logger(__name__)
-
-
-def image_grid(imgs, rows, cols):
-    assert len(imgs) == rows * cols
-
-    w, h = imgs[0].size
-    grid = Image.new("RGB", size=(cols * w, rows * h))
-
-    for i, img in enumerate(imgs):
-        grid.paste(img, box=(i % cols * w, i // cols * h))
-    return grid
-
-
-def log_validation(
-    vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step, is_final_validation=False
-):
-    logger.info("Running validation... ")
-
-    if not is_final_validation:
-        controlnet = accelerator.unwrap_model(controlnet)
-    else:
-        controlnet = ControlNetModel.from_pretrained(args.output_dir, torch_dtype=weight_dtype)
-
-    pipeline = StableDiffusionControlNetPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        vae=vae,
-        text_encoder=text_encoder,
-        tokenizer=tokenizer,
-        unet=unet,
-        controlnet=controlnet,
-        safety_checker=None,
-        revision=args.revision,
-        variant=args.variant,
-        torch_dtype=weight_dtype,
-    )
-    pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
-    pipeline = pipeline.to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
-
-    if args.enable_xformers_memory_efficient_attention:
-        pipeline.enable_xformers_memory_efficient_attention()
-
-    if args.seed is None:
-        generator = None
-    else:
-        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
-
-    if len(args.validation_image) == len(args.validation_prompt):
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt
-    elif len(args.validation_image) == 1:
-        validation_images = args.validation_image * len(args.validation_prompt)
-        validation_prompts = args.validation_prompt
-    elif len(args.validation_prompt) == 1:
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt * len(args.validation_image)
-    else:
-        raise ValueError(
-            "number of `args.validation_image` and `args.validation_prompt` should be checked in `parse_args`"
-        )
-
-    image_logs = []
-    inference_ctx = contextlib.nullcontext() if is_final_validation else torch.autocast("cuda")
-
-    for validation_prompt, validation_image in zip(validation_prompts, validation_images):
-        validation_image = Image.open(validation_image).convert("RGB")
-
-        images = []
-
-        for _ in range(args.num_validation_images):
-            with inference_ctx:
-                image = pipeline(
-                    validation_prompt, validation_image, num_inference_steps=20, generator=generator
-                ).images[0]
-
-            images.append(image)
-
-        image_logs.append(
-            {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt}
-        )
-
-    tracker_key = "test" if is_final_validation else "validation"
-    for tracker in accelerator.trackers:
-        if tracker.name == "tensorboard":
-            for log in image_logs:
-                images = log["images"]
-                validation_prompt = log["validation_prompt"]
-                validation_image = log["validation_image"]
-
-                formatted_images = []
-
-                formatted_images.append(np.asarray(validation_image))
-
-                for image in images:
-                    formatted_images.append(np.asarray(image))
-
-                formatted_images = np.stack(formatted_images)
-
-                tracker.writer.add_images(validation_prompt, formatted_images, step, dataformats="NHWC")
-        elif tracker.name == "wandb":
-            formatted_images = []
-
-            for log in image_logs:
-                images = log["images"]
-                validation_prompt = log["validation_prompt"]
-                validation_image = log["validation_image"]
-
-                formatted_images.append(wandb.Image(validation_image, caption="Controlnet conditioning"))
-
-                for image in images:
-                    image = wandb.Image(image, caption=validation_prompt)
-                    formatted_images.append(image)
-
-            tracker.log({tracker_key: formatted_images})
-        else:
-            logger.warning(f"image logging not implemented for {tracker.name}")
-
-        del pipeline
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        return image_logs
-
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
     text_encoder_config = PretrainedConfig.from_pretrained(
@@ -218,7 +105,6 @@ def save_model_card(repo_id: str, image_logs=None, base_model=str, repo_folder=N
             validation_image.save(os.path.join(repo_folder, "image_control.png"))
             img_str += f"prompt: {validation_prompt}\n"
             images = [validation_image] + images
-            image_grid(images, 1, len(images)).save(os.path.join(repo_folder, f"images_{i}.png"))
             img_str += f"![images_{i})](./images_{i}.png)\n"
 
     model_description = f"""
@@ -626,6 +512,125 @@ def collate_fn(examples):
 
 
 def main(args):
+    # Logging 
+    num_inference_steps = 10
+    image_guidance_scale = 0
+    guidance_scale = 0
+    inference_batch_size = 8
+    dir_he = Path("/graphics/scratch2/students/grosskop/benchmark_er_testset/valA/")
+    dir_ihc_target = Path("/graphics/scratch2/students/grosskop/benchmark_er_testset/valB")
+    dir_ihc_genereated = os.path.join(args.output_dir, "generated")
+    os.makedirs(dir_ihc_genereated, exist_ok=True)
+
+    def genreateImages(pipe):
+        steps = 1000 // inference_batch_size
+        for step in tqdm(range(steps), total=steps):
+            indices = list(range(step * inference_batch_size, (step + 1) * inference_batch_size))
+            batch = list(map(lambda l: PIL.Image.open(f"{dir_he}/{l:03d}.jpg"), indices))
+            tensor_batch = torch.stack([v2.ToTensor()(image) for image in batch]).to(device=pipe.device, dtype=torch.bfloat16)
+            
+            he_image_embeds = pipe.vae.encode(tensor_batch).latent_dist.mode()
+            
+            ihc_generated = pipe([args.translation_prompt] * len(tensor_batch),
+                image=tensor_batch,
+                he_image_embeds=he_image_embeds,
+                num_inference_steps=num_inference_steps,
+                image_guidance_scale=image_guidance_scale,
+                guidance_scale=guidance_scale,
+                generator=torch.Generator("cuda").manual_seed(0),
+            ).images
+
+            for batch_index, image in enumerate(ihc_generated):
+                file_index = step * inference_batch_size + batch_index
+                image.save(f"{dir_ihc_genereated}/{file_index:03d}.jpg")
+
+
+    def computeMetrics():
+        ssim_scores = []
+        psnr_scores = []
+        for index, path in tqdm(enumerate(dir_ihc_target.glob('*.jpg')), total=1000):
+            groundtruth = PIL.Image.open(path).convert("RGB")
+            generated = PIL.Image.open(str(os.path.join(dir_ihc_genereated, path.name))).convert("RGB")
+
+            ihcGeneratedCV = cv2.cvtColor(np.asarray(generated), cv2.COLOR_RGB2GRAY)
+            ihcGroundTruthCV = cv2.cvtColor(np.asarray(groundtruth), cv2.COLOR_RGB2GRAY)
+
+            ssimValue = ssim(ihcGroundTruthCV, ihcGeneratedCV)
+            psnrValue = cv2.PSNR(ihcGroundTruthCV, ihcGeneratedCV)
+
+            psnr_scores.append(psnrValue)
+            ssim_scores.append(ssimValue)
+            
+        fid_ihc = compute_fid(dir_ihc_target, dir_ihc_genereated)
+        
+        return statistics.mean(ssim_scores), statistics.mean(psnr_scores), fid_ihc
+        
+    def log_validation(
+        vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step, is_final_validation=False
+    ):
+        logger.info("Running validation... ")
+
+        if not is_final_validation:
+            controlnet = accelerator.unwrap_model(controlnet)
+        else:
+            controlnet = ControlNetModel.from_pretrained(args.output_dir, torch_dtype="bfloat16")
+
+        pipeline = StableDiffusionControlNetPipeline.from_pretrained(
+            args.pretrained_model_name_or_path,
+            vae=vae,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            unet=unet,
+            controlnet=controlnet,
+            safety_checker=None,
+            revision=args.revision,
+            variant=args.variant,
+            torch_dtype=weight_dtype,
+        )
+        pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
+        pipeline = pipeline.to(accelerator.device)
+        pipeline.set_progress_bar_config(disable=True)
+
+        if args.enable_xformers_memory_efficient_attention:
+            pipeline.enable_xformers_memory_efficient_attention()
+
+        translated_images = []
+        with torch.autocast("cuda", dtype=torch.bfloat16): 
+            genreateImages(pipeline)
+            ssim_score, psnr_score, fid_ihc = computeMetrics()
+                
+            he_image = PIL.Image.open("val_image_he.jpg")
+            for i in range(args.num_validation_images):
+                translated_images.append(pipeline(args.translation_prompt, 
+                            he_image, 
+                            num_inference_steps=num_inference_steps,
+                            image_guidance_scale=image_guidance_scale,
+                            guidance_scale=guidance_scale,
+                            generator=torch.Generator(device=accelerator.device).manual_seed(i),
+                            ).images[0]
+                )
+                
+        for tracker in accelerator.trackers:
+            if tracker.name == "wandb":
+                tracker.log(
+                    {
+                        "validation": [
+                            wandb.Image(image, caption="002.jpg pred")
+                            for i, image in enumerate(translated_images)
+                        ],
+                        "ssim": ssim_score, 
+                        "psnr": psnr_score, 
+                        "fid ihc": fid_ihc
+                    }
+                )
+            else:
+                logger.warning(f"image logging not implemented for {tracker.name}")
+
+            del pipeline
+            gc.collect()
+            torch.cuda.empty_cache()
+
+
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError(
             "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
@@ -707,7 +712,16 @@ def main(args):
     else:
         logger.info("Initializing controlnet weights from unet")
         controlnet = ControlNetModel.from_unet(unet)
-        # TODO: Copy ConvIn
+        # conv_in_in_channels = 4
+        # controlnet.register_to_config(in_channels=conv_in_in_channels)
+        # with torch.no_grad():
+        #     new_conv_in = nn.Conv2d(
+        #         conv_in_in_channels, unet.conv_in.out_channels, unet.conv_in.kernel_size, unet.conv_in.stride, unet.conv_in.padding
+        #     )
+        #     # new_conv_in.weight.zero_()
+        #     new_conv_in.weight.copy_(unet.conv_in.weight[:, :4, :, :])
+        #     new_conv_in.bias.copy_(unet.conv_in.bias)
+        #     controlnet.conv_in = new_conv_in
 
     # Taken from [Sayak Paul's Diffusers PR #6511](https://github.com/huggingface/diffusers/pull/6511/files)
     def unwrap_model(model):
@@ -987,6 +1001,9 @@ def main(args):
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents_ihc)
+                offset_noise = 0.1 * torch.randn(latents_ihc.shape[0], latents_ihc.shape[1], 1, 1).to("cuda")
+                noise += offset_noise
+                
                 bsz = latents_ihc.shape[0]
                 # Sample a random timestep for each image
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents_ihc.device)
@@ -998,21 +1015,23 @@ def main(args):
                     dtype=weight_dtype
                 )
 
-                he_image_embeds = vae.encode(batch["he_pixel_values"].to(weight_dtype)).latent_dist.sample() # TODO: Try mode()?
+                he_image_embeds = vae.encode(batch["he_pixel_values"].to(dtype=weight_dtype)).latent_dist.mode().to(dtype=weight_dtype)
+
+                concatenated_noisy_latents = torch.cat([noisy_latents, he_image_embeds], dim=1)
 
                 down_block_res_samples, mid_block_res_sample = controlnet(
-                    noisy_latents,
+                    concatenated_noisy_latents,
                     timesteps,
                     encoder_hidden_states=translation_prompt,
-                    controlnet_cond=he_image_embeds,
+                    controlnet_cond=batch["he_pixel_values"],
                     return_dict=False,
                 )
 
                 # Predict the noise residual
                 model_pred = unet(
-                    noisy_latents,
+                    concatenated_noisy_latents,
                     timesteps,
-                    encoder_hidden_states=translation_prompt,
+                    encoder_hidden_states=translation_prompt.to(dtype=weight_dtype),
                     down_block_additional_residuals=[
                         sample.to(dtype=weight_dtype) for sample in down_block_res_samples
                     ],
@@ -1068,7 +1087,7 @@ def main(args):
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-                    if args.validation_prompt is not None and global_step % args.validation_steps == 0:
+                    if global_step % args.validation_steps == 0:
                         image_logs = log_validation(
                             vae,
                             text_encoder,
@@ -1095,34 +1114,18 @@ def main(args):
         controlnet.save_pretrained(args.output_dir)
 
         # Run a final round of validation.
-        image_logs = None
-        if args.validation_prompt is not None:
-            image_logs = log_validation(
-                vae=vae,
-                text_encoder=text_encoder,
-                tokenizer=tokenizer,
-                unet=unet,
-                controlnet=None,
-                args=args,
-                accelerator=accelerator,
-                weight_dtype=weight_dtype,
-                step=global_step,
-                is_final_validation=True,
-            )
-
-        if args.push_to_hub:
-            save_model_card(
-                repo_id,
-                image_logs=image_logs,
-                base_model=args.pretrained_model_name_or_path,
-                repo_folder=args.output_dir,
-            )
-            upload_folder(
-                repo_id=repo_id,
-                folder_path=args.output_dir,
-                commit_message="End of training",
-                ignore_patterns=["step_*", "epoch_*"],
-            )
+        log_validation(
+            vae=vae,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            unet=unet,
+            controlnet=None,
+            args=args,
+            accelerator=accelerator,
+            weight_dtype=weight_dtype,
+            step=global_step,
+            is_final_validation=True,
+        )
 
     accelerator.end_training()
 

@@ -1,7 +1,7 @@
 MODEL_NAME="/graphics/scratch2/students/grosskop/diffusers/examples/instruct_pix2pix/output_08_13_addNoise"
-PROJECT_NAME="Thesis ControlNet + InstructPix2Pix"
-RUN_TITLE="25_01_04 Canny Edges Loss"
-RUN_DESCRIPTION="ControlNet of finetuned InstructPix2Pix using H&E Image as input to frozen network and Canny Edges of H&E and H&E Lantes to ControlNet and Canny Edges loss between predicted image and H&E Input Image"
+PROJECT_NAME="Thesis ControlNet + InstructPix2Pix + Testrun"
+RUN_TITLE="25_01_04 Test run"
+RUN_DESCRIPTION="Test run, should not make existing model worse :D" # "ControlNet of finetuned InstructPix2Pix using H&E Image as input to frozen network and H&E Image to ControlNet and Canny Edges loss between predicted image and H&E Input Image"
 OUTPUT_DIR="${RUN_TITLE// /_}"
 
 export CUDA_VISIBLE_DEVICES=1
@@ -24,6 +24,8 @@ nohup accelerate launch --gpu_ids $CUDA_VISIBLE_DEVICES train_controlnet.py \
     --enable_xformers_memory_efficient_attention \
     --seed=0 \
     --report_to="wandb" \
+    --max_train_steps=5000 \
+    --validation_steps=500 \
     --checkpointing_steps=2000 \
     --checkpoints_total_limit=4 \
     > $OUTPUT_DIR.log 2>&1 &
