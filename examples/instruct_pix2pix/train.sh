@@ -15,7 +15,7 @@ nohup accelerate launch --gpu_ids $CUDA_VISIBLE_DEVICES train_instruct_pix2pix.p
     --description="$RUN_DESCRIPTION" \
     --pretrained_model_name_or_path=$MODEL_NAME \
     --train_batch_size=16 \
-    --learning_rate=1e-4\
+    --learning_rate=1e-4 \
     --num_train_epochs=550 \
     --mixed_precision="bf16" \
     --resolution=512 \
