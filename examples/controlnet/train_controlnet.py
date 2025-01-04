@@ -562,6 +562,18 @@ def parse_args(input_args=None):
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
+    parser.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        required=False,
+    )
+    parser.add_argument(
+        "--description",
+        type=str,
+        default=None,
+        required=False,
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -978,7 +990,7 @@ def main(args):
         tracker_config.pop("validation_prompt")
         tracker_config.pop("validation_image")
 
-        accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
+        accelerator.init_trackers(args.tracker_project_name, config=tracker_config, init_kwargs={"wandb": {"name": args.name, "notes": args.description}})
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
