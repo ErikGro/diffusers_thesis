@@ -561,7 +561,8 @@ def main(args):
             psnr_scores.append(psnrValue)
             ssim_scores.append(ssimValue)
             
-        fid_ihc = compute_fid(dir_ihc_target, dir_ihc_genereated)
+        with torch.autocast("cuda", dtype=torch.float16): 
+            fid_ihc = compute_fid(dir_ihc_target, dir_ihc_genereated)
         
         return statistics.mean(ssim_scores), statistics.mean(psnr_scores), fid_ihc
         
@@ -600,9 +601,12 @@ def main(args):
             ssim_score, psnr_score, fid_ihc = computeMetrics()
                 
             he_image = PIL.Image.open("val_image_he.jpg")
+            he_image_embeds = pipeline.vae.encode(v2.ToTensor()(he_image).unsqueeze(0).to(device=pipeline.device, dtype=pipeline.vae.dtype)).latent_dist.mode()
+            
             for i in range(args.num_validation_images):
                 translated_images.append(pipeline(args.translation_prompt, 
-                            he_image, 
+                            image=he_image, 
+                            he_image_embeds=he_image_embeds,
                             num_inference_steps=num_inference_steps,
                             image_guidance_scale=image_guidance_scale,
                             guidance_scale=guidance_scale,
