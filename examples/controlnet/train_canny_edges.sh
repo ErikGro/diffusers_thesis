@@ -1,11 +1,12 @@
 MODEL_NAME="/graphics/scratch2/students/grosskop/diffusers/examples/instruct_pix2pix/output_08_13_addNoise"
 PROJECT_NAME="Thesis ControlNet + InstructPix2Pix"
-RUN_TITLE="25_01_05 MSE + weighted Canny Edges MSE on Prediction and H&E"
-RUN_DESCRIPTION="MSE is computed between added noise to latents and predicted noise. Canny edges MSE is computed between the predicted IHC Pixel Image and ground truth H&E pixel image. The loss for Canny Edges is scaled by w = - t/T + 1"
-# Alternative non-linear weight scheduling: w = (1 - t/T)^2
+RUN_TITLE="25_01_05 MSE and Canny Edges MSE on Prediction and HE"
+RUN_DESCRIPTION="MSE is computed between added noise to latents and predicted noise. Canny edges MSE is computed between the predicted IHC Pixel Image and ground truth H&E pixel image."
+# Alternative non-linear weight scheduling: w = (1 - t/T)^2, Linear weight scheduling: w = - t/T + 1
+
 OUTPUT_DIR="${RUN_TITLE// /_}"
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=3
 export NCCL_P2P_DISABLE="1"
 export NCCL_IB_DISABLE="1"
 
@@ -15,8 +16,8 @@ nohup accelerate launch --gpu_ids $CUDA_VISIBLE_DEVICES train_controlnet_canny_e
     --name="$RUN_TITLE" \
     --description="$RUN_DESCRIPTION" \
     --pretrained_model_name_or_path=$MODEL_NAME \
-    --train_batch_size=8 \
-    --learning_rate=5e-6 \
+    --train_batch_size=2 \
+    --learning_rate=1e-6 \
     --num_train_epochs=50 \
     --mixed_precision="bf16" \
     --resolution=512 \

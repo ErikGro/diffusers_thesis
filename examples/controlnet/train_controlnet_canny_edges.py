@@ -1015,25 +1015,24 @@ def main(args):
     )
     
     def compute_canny_loss(batch_predicted_pixels, batch_he_pixels):
-        batch_predicted_pixels = (batch_predicted_pixels / 2 + 0.5).clamp(0, 1).cpu()
-        batch_he_pixels = (batch_he_pixels / 2 + 0.5).clamp(0, 1).cpu()
+        batch_predicted_pixels = (batch_predicted_pixels.to(torch.float32) / 2 + 0.5).clamp(0, 1).cpu() * 255
+        batch_he_pixels = (batch_he_pixels.to(torch.float32) / 2 + 0.5).clamp(0, 1).cpu() * 255
         
         mse_losses = []
         for i in range(batch_he_pixels.shape[0]):
             predicted_pixels = batch_predicted_pixels[i].numpy().astype(np.uint8)
             he_pixels = batch_he_pixels[i].numpy().astype(np.uint8)
             
-            predicted_grayscale = cv2.cvtColor(predicted_pixels, cv2.COLOR_RGB2GRAY)
-            he_grayscale = cv2.cvtColor(he_pixels, cv2.COLOR_RGB2GRAY)
+            predicted_grayscale = cv2.cvtColor(predicted_pixels.transpose(1, 2, 0), cv2.COLOR_RGB2GRAY)
+            he_grayscale = cv2.cvtColor(he_pixels.transpose(1, 2, 0), cv2.COLOR_RGB2GRAY)
             
-            predicted_edges = cv2.Canny(predicted_grayscale, 60, 200)
-            he_edges = cv2.Canny(he_grayscale, 170, 256)
+            predicted_edges = cv2.Canny(predicted_grayscale, 60, 200).astype(np.float32) / 255.0
+            he_edges = cv2.Canny(he_grayscale, 170, 256).astype(np.float32) / 255.0
             
             mse_losses.append((predicted_edges - he_edges) ** 2)
             
-        return torch.from_numpy(np.mean(mse_losses))
+        return torch.mean(torch.from_numpy(np.array(mse_losses)), dtype=torch.float32)
         
-
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(controlnet):
@@ -1089,22 +1088,15 @@ def main(args):
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
                 loss_mse = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                print(f"loss_mse.requires_grad: {loss_mse.requires_grad}")
-                print(f"model_pred.requires_grad: {model_pred.requires_grad}")
                 predicted_latents = (noisy_latents - model_pred)
-                print(f"predicted_latents.requires_grad: {predicted_latents.requires_grad}")
-                # predicted_latents.requires_grad_()
-                predicted_pixels = vae.decode(predicted_latents / vae.config.scaling_factor, return_dict=False)[0]
-                print(f"predicted_pixels.requires_grad: {predicted_pixels.requires_grad}")
-                
+                predicted_pixels = vae.decode((predicted_latents / vae.config.scaling_factor).to(dtype=weight_dtype), return_dict=False)[0]
                 loss_canny = compute_canny_loss(predicted_pixels.detach(), batch["he_pixel_values"]).to(device=loss_mse.device, dtype=weight_dtype)
+                # weight_canny = - t/T + 1
                 
                 lambda_canny = 1
                 
                 total_loss = loss_mse + lambda_canny * loss_canny
                 
-                print(f"total_loss.requires_grad: {total_loss.requires_grad}")
-
                 accelerator.backward(total_loss)
                 if accelerator.sync_gradients:
                     params_to_clip = controlnet.parameters()
@@ -1157,7 +1149,7 @@ def main(args):
                             global_step,
                         )
 
-            logs = {"loss": loss_mse.detach().item(), "canny_loss": loss_canny, "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"loss": loss_mse.detach().item(), "canny_loss": loss_canny.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
