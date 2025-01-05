@@ -24,7 +24,7 @@ nohup accelerate launch --gpu_ids $CUDA_VISIBLE_DEVICES train_controlnet.py \
     --enable_xformers_memory_efficient_attention \
     --seed=0 \
     --report_to="wandb" \
-    --validation_steps=500 \
+    --validation_steps=1000 \
     --checkpointing_steps=4000 \
     --checkpoints_total_limit=4 \
     > $OUTPUT_DIR.log 2>&1 &

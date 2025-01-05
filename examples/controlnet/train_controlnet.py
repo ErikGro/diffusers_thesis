@@ -527,8 +527,11 @@ def main(args):
         for step in tqdm(range(steps), total=steps):
             indices = list(range(step * inference_batch_size, (step + 1) * inference_batch_size))
             batch = list(map(lambda l: PIL.Image.open(f"{dir_he}/{l:03d}.jpg"), indices))
-            tensor_batch = torch.stack([v2.ToTensor()(image) for image in batch]).to(device=pipe.device, dtype=torch.bfloat16)
-            
+            transforms = v2.Compose([
+                v2.ToTensor(),
+                v2.Normalize([0.5], [0.5]),
+            ])
+            tensor_batch = torch.stack([transforms(image) for image in batch]).to(device=pipe.device, dtype=torch.bfloat16)
             he_image_embeds = pipe.vae.encode(tensor_batch).latent_dist.mode()
             
             ihc_generated = pipe([args.translation_prompt] * len(tensor_batch),
@@ -601,7 +604,11 @@ def main(args):
             ssim_score, psnr_score, fid_ihc = computeMetrics()
                 
             he_image = PIL.Image.open("val_image_he.jpg")
-            he_image_embeds = pipeline.vae.encode(v2.ToTensor()(he_image).unsqueeze(0).to(device=pipeline.device, dtype=pipeline.vae.dtype)).latent_dist.mode()
+            transforms = v2.Compose([
+                v2.ToTensor(),
+                v2.Normalize([0.5], [0.5]),
+            ])
+            he_image_embeds = pipeline.vae.encode(transforms(he_image).unsqueeze(0).to(device=pipeline.device, dtype=pipeline.vae.dtype)).latent_dist.mode()
             
             for i in range(args.num_validation_images):
                 translated_images.append(pipeline(args.translation_prompt, 
@@ -987,6 +994,18 @@ def main(args):
     else:
         initial_global_step = 0
 
+    log_validation(
+        vae,
+        text_encoder,
+        tokenizer,
+        unet,
+        controlnet,
+        args,
+        accelerator,
+        weight_dtype,
+        global_step,
+    )
+                        
     progress_bar = tqdm(
         range(0, args.max_train_steps),
         initial=initial_global_step,
@@ -995,7 +1014,6 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
 
-    image_logs = None
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(controlnet):
@@ -1092,7 +1110,7 @@ def main(args):
                         logger.info(f"Saved state to {save_path}")
 
                     if global_step % args.validation_steps == 0:
-                        image_logs = log_validation(
+                        log_validation(
                             vae,
                             text_encoder,
                             tokenizer,
