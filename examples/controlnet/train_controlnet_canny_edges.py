@@ -531,7 +531,7 @@ def main(args):
                 v2.ToTensor(),
                 v2.Normalize([0.5], [0.5]),
             ])
-            tensor_batch = torch.stack([transforms(image) for image in batch]).to(device=pipe.device, dtype=torch.bfloat16)
+            tensor_batch = torch.stack([transforms(image) for image in batch]).to(device=pipe.device, dtype=pipe.dtype)
             he_image_embeds = pipe.vae.encode(tensor_batch).latent_dist.mode()
             
             ihc_generated = pipe([args.translation_prompt] * len(tensor_batch),

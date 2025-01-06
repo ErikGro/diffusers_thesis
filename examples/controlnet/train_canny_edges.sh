@@ -6,7 +6,7 @@ RUN_DESCRIPTION="MSE is computed between added noise to latents and predicted no
 
 OUTPUT_DIR="${RUN_TITLE// /_}"
 
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=1
 export NCCL_P2P_DISABLE="1"
 export NCCL_IB_DISABLE="1"
 
@@ -16,7 +16,7 @@ nohup accelerate launch --gpu_ids $CUDA_VISIBLE_DEVICES train_controlnet_canny_e
     --name="$RUN_TITLE" \
     --description="$RUN_DESCRIPTION" \
     --pretrained_model_name_or_path=$MODEL_NAME \
-    --train_batch_size=2 \
+    --train_batch_size=1 \
     --learning_rate=1e-6 \
     --num_train_epochs=50 \
     --mixed_precision="bf16" \
@@ -26,8 +26,8 @@ nohup accelerate launch --gpu_ids $CUDA_VISIBLE_DEVICES train_controlnet_canny_e
     --enable_xformers_memory_efficient_attention \
     --seed=0 \
     --report_to="wandb" \
-    --validation_steps=1000 \
-    --checkpointing_steps=4000 \
+    --validation_steps=2048 \
+    --checkpointing_steps=8192 \
     --checkpoints_total_limit=4 \
     > $OUTPUT_DIR.log 2>&1 &
     
