@@ -1183,7 +1183,7 @@ def main(args):
                 latents_pred = noisy_latents - model_pred
                 loss_cut = cut_loss.get_latent_cut_loss(he_image_embeds, latents_pred) * 0.05
                 
-                lambda_cut_loss = 0.05
+                lambda_cut_loss = 0.3
                 loss_total = loss_mse + lambda_cut_loss * loss_cut
 
                 accelerator.backward(loss_total)
