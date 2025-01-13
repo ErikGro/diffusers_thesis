@@ -47,9 +47,9 @@ from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionInstructPix2PixPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionInstructPix2PixPipeline, UNet2DConditionModel, DDIMScheduler
 from diffusers.optimization import get_scheduler
-from diffusers.training_utils import EMAModel
+from diffusers.training_utils import EMAModel, compute_snr
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
@@ -312,7 +312,20 @@ def parse_args():
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
     )
-
+    parser.add_argument(
+        "--prediction_type",
+        type=str,
+        default=None,
+        help="The prediction_type that shall be used for training. Choose between 'epsilon' or 'v_prediction' or leave `None`. If left to `None` the default prediction type of the scheduler: `noise_scheduler.config.prediction_type` is chosen.",
+    )
+    parser.add_argument(
+        "--snr_gamma",
+        type=float,
+        default=None,
+        help="SNR weighting gamma to be used if rebalancing the loss. Recommended value is 5.0. "
+        "More details here: https://arxiv.org/abs/2303.09556.",
+    )
+    
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -365,7 +378,7 @@ def main():
     )
     
     # Logging 
-    num_inference_steps = 10
+    num_inference_steps = 50
     image_guidance_scale = 0
     guidance_scale = 0
     inference_batch_size = 8
@@ -425,7 +438,8 @@ def main():
             f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
             f" {args.translation_prompt}."
         )
-        pipeline = pipeline.to(accelerator.device)                    
+        pipeline = pipeline.to(accelerator.device)
+        pipeline.scheduler = DDIMScheduler.from_config(pipeline.scheduler.config, prediction_type="v_prediction", timestep_spacing="trailing", rescale_betas_zero_snr=True)                    
         pipeline.set_progress_bar_config(disable=True)
         
         if torch.backends.mps.is_available():
@@ -444,7 +458,7 @@ def main():
                     pipeline(
                         args.translation_prompt,
                         image=he_image,
-                        num_inference_steps=20,
+                        num_inference_steps=50,
                         image_guidance_scale=0,
                         guidance_scale=0,
                         generator=torch.Generator(device=accelerator.device).manual_seed(i),
@@ -502,7 +516,7 @@ def main():
             ).repo_id
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler", prediction_type="v_prediction", timestep_spacing="trailing", rescale_betas_zero_snr=True)
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
     )
@@ -862,8 +876,8 @@ def main():
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(ihc_latents)
-                offset_noise = 0.1 * torch.randn(ihc_latents.shape[0], ihc_latents.shape[1], 1, 1).to("cuda")
-                noise += offset_noise
+                # offset_noise = 0.1 * torch.randn(ihc_latents.shape[0], ihc_latents.shape[1], 1, 1).to("cuda")
+                # noise += offset_noise
                 bsz = ihc_latents.shape[0]
                 # Sample a random timestep for each image
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=ihc_latents.device)
@@ -902,6 +916,11 @@ def main():
                 concatenated_noisy_latents = torch.cat([noisy_latents, he_image_embeds], dim=1)
 
                 # Get the target for loss depending on the prediction type
+                if args.prediction_type is not None:
+                    # set prediction_type of scheduler if defined
+                    noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+
+                # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
                 elif noise_scheduler.config.prediction_type == "v_prediction":
@@ -911,7 +930,26 @@ def main():
 
                 # Predict the noise residual and compute loss
                 model_pred = unet(concatenated_noisy_latents, timesteps, translation_prompt, return_dict=False)[0]
-                mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                
+                if args.snr_gamma is None:
+                    mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                else:
+                    # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+                    # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+                    # This is discussed in Section 4.2 of the same paper.
+                    snr = compute_snr(noise_scheduler, timesteps)
+                    mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
+                        dim=1
+                    )[0]
+                    if noise_scheduler.config.prediction_type == "epsilon":
+                        mse_loss_weights = mse_loss_weights / snr
+                    elif noise_scheduler.config.prediction_type == "v_prediction":
+                        mse_loss_weights = mse_loss_weights / (snr + 1)
+
+                    mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                    mse_loss = mse_loss.mean(dim=list(range(1, len(mse_loss.shape)))) * mse_loss_weights
+                    mse_loss = mse_loss.mean()
+                    
                 epoch_mse_losses.append(mse_loss.item())
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(mse_loss.repeat(args.train_batch_size)).mean()
