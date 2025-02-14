@@ -47,15 +47,16 @@ from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionInstructPix2PixPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionInstructPix2PixPipeline, UNet2DConditionModel, DDIMScheduler
 from diffusers.optimization import get_scheduler
-from diffusers.training_utils import EMAModel
+from diffusers.training_utils import EMAModel, compute_snr
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 from torchvision.transforms import v2
 from skimage.metrics import structural_similarity as ssim
 import cv2
+from torch.optim.lr_scheduler import LambdaLR
 
 if is_wandb_available():
     import wandb
@@ -195,6 +196,12 @@ def parse_args():
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
+        "--prediction_type",
+        type=str,
+        default=None,
+        help="The prediction_type that shall be used for training. Choose between 'epsilon' or 'v_prediction' or leave `None`. If left to `None` the default prediction type of the scheduler: `noise_scheduler.config.prediction_type` is chosen.",
+    )
+    parser.add_argument(
         "--scale_lr",
         action="store_true",
         default=False,
@@ -228,6 +235,9 @@ def parse_args():
             "Whether or not to allow TF32 on Ampere GPUs. Can be used to speed up training. For more information, see"
             " https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices"
         ),
+    )
+    parser.add_argument(
+        "--input_perturbation", type=float, default=0, help="The scale of input perturbation. Recommended 0.1."
     )
     parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA model.")
     parser.add_argument(
@@ -318,6 +328,26 @@ def parse_args():
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
     )
+    parser.add_argument(
+        "--snr_gamma",
+        type=float,
+        default=None,
+        help="SNR weighting gamma to be used if rebalancing the loss. Recommended value is 5.0. "
+        "More details here: https://arxiv.org/abs/2303.09556.",
+    )
+    parser.add_argument(
+        "--bias_he_ihc",
+        type=float,
+        default=0.5,
+        help="Blends between only he generation at 0 an only he->ihc translation at 1"
+    )
+    parser.add_argument(
+        "--conditioning",
+        type=str,
+        default=None,
+        choices=["input", "xattention", "combined"],
+        help="Choose for conditioning translation by concatenating to input layers, adding via xattention or both",
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -374,7 +404,7 @@ def main():
     num_inference_steps = 10
     image_guidance_scale = 0
     guidance_scale = 0
-    inference_batch_size = 8
+    inference_batch_size = 4
     dir_he = Path("/graphics/scratch2/students/grosskop/benchmark_er_testset/valA/")
     dir_ihc_target = Path("/graphics/scratch2/students/grosskop/benchmark_er_testset/valB")
     dir_ihc_genereated = os.path.join(args.output_dir, "generated/ihc")
@@ -398,11 +428,9 @@ def main():
             ).images
             
             he_generated = pipe([args.he_generation_prompt] * len(tensor_batch),
-                image=torch.zeros_like(tensor_batch),
                 num_inference_steps=num_inference_steps,
                 image_guidance_scale=image_guidance_scale,
                 guidance_scale=guidance_scale,
-                generator=torch.Generator("cuda").manual_seed(0),
             ).images
 
             for batch_index, image in enumerate(ihc_generated):
@@ -440,13 +468,14 @@ def main():
         pipeline,
         args,
         accelerator,
-        generator,
-    ):
+        generator
+        ):
         logger.info(
             f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
             f" {args.translation_prompt}."
         )
-        pipeline = pipeline.to(accelerator.device)                    
+        # pipeline = pipeline.to(accelerator.device)    
+        pipeline.scheduler = DDIMScheduler.from_config(pipeline.scheduler.config, prediction_type="v_prediction", timestep_spacing="trailing", rescale_betas_zero_snr=True)                                    
         pipeline.set_progress_bar_config(disable=True)
         
         if torch.backends.mps.is_available():
@@ -476,7 +505,6 @@ def main():
                 he_images.append(
                     pipeline(
                         args.he_generation_prompt,
-                        image=torch.zeros(convert_to_np(he_image).shape, dtype=pipeline.dtype),
                         num_inference_steps=10,
                         image_guidance_scale=0,
                         guidance_scale=0,
@@ -542,7 +570,8 @@ def main():
             ).repo_id
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler", prediction_type="v_prediction", timestep_spacing="trailing", rescale_betas_zero_snr=True)
+    # noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
     )
@@ -572,6 +601,7 @@ def main():
         )
         new_conv_in.weight.zero_()
         new_conv_in.weight[:, :4, :, :].copy_(unet.conv_in.weight)
+        new_conv_in.bias[:len(unet.conv_in.bias)].copy_(unet.conv_in.bias)
         unet.conv_in = new_conv_in
 
     # Freeze vae and text_encoder
@@ -772,6 +802,19 @@ def main():
         num_warmup_steps=num_warmup_steps_for_scheduler,
         num_training_steps=num_training_steps_for_scheduler,
     )
+    
+    # def custom_lr_schedule(current_step):
+    #     if single_learning_steps > 1:
+    #         factor = single_steps / single_learning_steps
+    #         learning_rate = (1 - factor) * final_learning_rate / 100 + factor * final_learning_rate
+    #     else:
+    #         learning_rate = final_learning_rate
+        
+    #     weird_factor = 10000
+    #     return learning_rate * weird_factor
+
+    # lr_lambda = lambda step: custom_lr_schedule(step)
+    # lr_scheduler = LambdaLR(optimizer, lr_lambda)
 
     # Prepare everything with our `accelerator`.
     unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -849,37 +892,36 @@ def main():
             first_epoch = global_step // num_update_steps_per_epoch
             resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
     
-    if args.use_ema:
-        # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-        ema_unet.store(unet.parameters())
-        ema_unet.copy_to(unet.parameters())
-    # The models need unwrapping because for compatibility in distributed training mode.
-    pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        unet=unwrap_model(unet),
-        text_encoder=unwrap_model(text_encoder),
-        vae=unwrap_model(vae),
-        revision=args.revision,
-        variant=args.variant,
-        torch_dtype=weight_dtype,
-        safety_checker = None,
-        requires_safety_checker = False
-    )
-    
+    # if args.use_ema:
+    #     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+    #     ema_unet.store(unet.parameters())
+    #     ema_unet.copy_to(unet.parameters())
+    # # The models need unwrapping because for compatibility in distributed training mode.
+    # pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
+    #     args.pretrained_model_name_or_path,
+    #     unet=unwrap_model(unet),
+    #     text_encoder=unwrap_model(text_encoder),
+    #     vae=unwrap_model(vae),
+    #     revision=args.revision,
+    #     variant=args.variant,
+    #     torch_dtype=weight_dtype,
+    #     safety_checker = None,
+    #     requires_safety_checker = False
+    # )
 
-    log_validation(
-        pipeline,
-        args,
-        accelerator,
-        generator,
-    )
+    # log_validation(
+    #     pipeline,
+    #     args,
+    #     accelerator,
+    #     generator,
+    # )
 
-    if args.use_ema:
-        # Switch back to the original UNet parameters.
-        ema_unet.restore(unet.parameters())
+    # if args.use_ema:
+    #     # Switch back to the original UNet parameters.
+    #     ema_unet.restore(unet.parameters())
 
-    del pipeline
-    torch.cuda.empty_cache()
+    # del pipeline
+    # torch.cuda.empty_cache()
     
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
@@ -896,19 +938,23 @@ def main():
                     progress_bar.update(1)
                 continue
 
-            with accelerator.accumulate(unet):
-                generate_he = random.randint(0, 1) == 1
-                
-                # We want to learn the denoising process w.r.t the edited images which
-                # are conditioned on the original image (which was edited) and the edit instruction.
-                # So, first, convert images to latent space.
-                target_latents = vae.encode(batch["he_pixel_values" if generate_he else "ihc_pixel_values"].to(weight_dtype)).latent_dist.sample()
+            with accelerator.accumulate(unet):                
+                batch_pixels = batch["ihc_pixel_values"]
+                mask = (torch.rand(len(batch_pixels)) > 0.5).byte()
+                # mask = torch.zeros(len(batch_pixels)).byte()
+                batch_pixels[mask] = batch["he_pixel_values"][mask]
+                target_latents = vae.encode(batch_pixels.to(weight_dtype)).latent_dist.sample()
                 target_latents = target_latents * vae.config.scaling_factor
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(target_latents)
+
                 offset_noise = 0.1 * torch.randn(target_latents.shape[0], target_latents.shape[1], 1, 1).to("cuda")
                 noise += offset_noise
+                
+                if args.input_perturbation:
+                    noise += args.input_perturbation * torch.randn_like(noise)
+                
                 bsz = target_latents.shape[0]
                 # Sample a random timestep for each image
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=target_latents.device)
@@ -921,31 +967,16 @@ def main():
                 # Get the additional image embedding for conditioning.
                 # Instead of getting a diagonal Gaussian here, we simply take the mode.
                 he_image_embeds = vae.encode(batch["he_pixel_values"].to(weight_dtype)).latent_dist.mode()
-
-                # Conditioning dropout to support classifier-free guidance during inference. For more details
-                # check out the section 3.2.1 of the original paper https://arxiv.org/abs/2211.09800.
-                if args.conditioning_dropout_prob is not None:
-                    random_p = torch.rand(bsz, device=target_latents.device, generator=generator)
-                    # Sample masks for the edit prompts.
-                    prompt_mask = random_p < 2 * args.conditioning_dropout_prob
-                    prompt_mask = prompt_mask.reshape(bsz, 1, 1)
-                    # Final text conditioning.
-                    null_conditioning = text_encoder(tokenize_captions([""]).to(accelerator.device))[0]
-                    translation_prompt = torch.where(prompt_mask, null_conditioning, translation_prompt)
-
-                    # Sample masks for the original images.
-                    image_mask_dtype = he_image_embeds.dtype
-                    image_mask = 1 - (
-                        (random_p >= args.conditioning_dropout_prob).to(image_mask_dtype)
-                        * (random_p < 3 * args.conditioning_dropout_prob).to(image_mask_dtype)
-                    )
-                    image_mask = image_mask.reshape(bsz, 1, 1, 1)
-                    # Final image conditioning.
-                    he_image_embeds = image_mask * he_image_embeds
-
+                he_image_embeds[mask] = torch.zeros_like(he_image_embeds)[mask]
+                    
                 # Concatenate the `original_image_embeds` with the `noisy_latents`.
-                concatenated_noisy_latents = torch.cat([noisy_latents, torch.zeros_like(he_image_embeds) if generate_he else he_image_embeds], dim=1)
+                concatenated_noisy_latents = torch.cat([noisy_latents, he_image_embeds], dim=1)
 
+                # Get the target for loss depending on the prediction type
+                if args.prediction_type is not None:
+                    # set prediction_type of scheduler if defined
+                    noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+                    
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
@@ -954,9 +985,30 @@ def main():
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
+                prompt_embeds = translation_prompt
+                prompt_embeds[mask] = he_prompt[mask]
                 # Predict the noise residual and compute loss
-                model_pred = unet(concatenated_noisy_latents, timesteps, he_prompt if generate_he else translation_prompt, return_dict=False)[0]
-                mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                model_pred = unet(concatenated_noisy_latents, timesteps, prompt_embeds, return_dict=False)[0]
+                
+                if args.snr_gamma is None:
+                    mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                else:
+                    # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+                    # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+                    # This is discussed in Section 4.2 of the same paper.
+                    snr = compute_snr(noise_scheduler, timesteps)
+                    mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
+                        dim=1
+                    )[0]
+                    if noise_scheduler.config.prediction_type == "epsilon":
+                        mse_loss_weights = mse_loss_weights / snr
+                    elif noise_scheduler.config.prediction_type == "v_prediction":
+                        mse_loss_weights = mse_loss_weights / (snr + 1)
+
+                    mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                    mse_loss = mse_loss.mean(dim=list(range(1, len(mse_loss.shape)))) * mse_loss_weights
+                    mse_loss = mse_loss.mean()
+                    
                 epoch_mse_losses.append(mse_loss.item())
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(mse_loss.repeat(args.train_batch_size)).mean()
@@ -1032,13 +1084,12 @@ def main():
                     safety_checker = None,
                     requires_safety_checker = False
                 )
-                
 
                 log_validation(
                     pipeline,
                     args,
                     accelerator,
-                    generator,
+                    generator
                 )
 
                 if args.use_ema:
@@ -1078,7 +1129,7 @@ def main():
             pipeline,
             args,
             accelerator,
-            generator,
+            generator
         )
     accelerator.end_training()
 
