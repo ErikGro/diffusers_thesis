@@ -1,6 +1,6 @@
 MODEL_NAME="botp/stable-diffusion-v1-5"
 PROJECT_NAME="Thesis InstructPix2Pix"
-RUN_TITLE="25_02_14 DEBUGGING"
+RUN_TITLE="25_02_14 Evaluation Eps Input"
 RUN_DESCRIPTION="baseline"
 OUTPUT_DIR="${RUN_TITLE// /_}"
 
@@ -8,15 +8,14 @@ export CUDA_VISIBLE_DEVICES=3
 export NCCL_P2P_DISABLE="1"
 export NCCL_IB_DISABLE="1"
 
-nohup accelerate launch --gpu_ids $CUDA_VISIBLE_DEVICES train_instruct_pix2pix_jointly.py \
-    --num_train_epochs=1 \
-    --validation_epochs=1 \
+nohup accelerate launch --num_processes=1 --num_machines=1 --mixed_precision=bf16 --dynamo_backend=no --gpu_ids $CUDA_VISIBLE_DEVICES train_instruct_pix2pix_jointly.py \
+    --num_train_epochs=300 \
+    --validation_epochs=10 \
     --prediction_type="epsilon" \
-    --snr_gamma=5 \
     --noise_offset=0.1 \
-    --input_perturbation=0.1 \
+    --input_perturbation=0 \
     --conditioning="input" \
-    --bias_ihc_he=0.5 \
+    --bias_he_ihc=0.5 \
     --output_dir=$OUTPUT_DIR \
     --project="$PROJECT_NAME" \
     --name="$RUN_TITLE" \
@@ -34,9 +33,11 @@ nohup accelerate launch --gpu_ids $CUDA_VISIBLE_DEVICES train_instruct_pix2pix_j
     --enable_xformers_memory_efficient_attention \
     --seed=0 \
     --checkpointing_steps=10000 \
-    --checkpoints_total_limit=4 \
+    --checkpoints_total_limit=2 \
+    --report_to="wandb" \
     > $OUTPUT_DIR.log 2>&1 &
 
     # --report_to="wandb" \
+    # --snr_gamma=3 \
     # --prediction_type    "epsilon", "v_prediction"
     # --conditioning       "input", "xattention", "combined"],

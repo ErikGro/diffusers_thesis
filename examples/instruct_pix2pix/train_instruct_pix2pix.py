@@ -25,6 +25,8 @@ from contextlib import nullcontext
 from pathlib import Path
 import statistics
 import random
+from transformers import AutoImageProcessor, Swinv2Model, Swinv2Config, Swinv2Model
+import timm
 
 import accelerate
 import datasets
@@ -364,11 +366,43 @@ def main():
         project_config=accelerator_project_config,
     )
     
+    image_processor = AutoImageProcessor.from_pretrained("microsoft/swinv2-tiny-patch4-window8-256")
+    image_processor.size = {"height": 512, "width": 512}
+    swinv2 = Swinv2Model.from_pretrained("microsoft/swinv2-tiny-patch4-window8-256")
+    swinv2.to("cuda")
+    
+    # tile_encoder = timm.create_model("hf_hub:prov-gigapath/prov-gigapath", pretrained=True, features_only=True).to("cuda")
+    # tile_encoder.eval()
+
+    transform = transforms.Compose(
+        [
+            transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+            # transforms.Lambda(lambda x: x / 255.0),
+            # transforms.ToTensor(),
+            
+            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ]
+    )
+    
+    def get_image_hidden_states(pil_image):
+        print(pil_image.shape) # [4, 3, 512, 512]
+        inputs = image_processor(pil_image, return_tensors="pt").to("cuda")
+        with torch.no_grad():
+            hidden_states = swinv2(**inputs).last_hidden_state
+            print(hidden_states.shape) # [4, 256, 768]
+            return hidden_states
+        # inputs = transform(pil_image.to(torch.float32)).half().to("cuda")
+        # print(inputs.shape) # [4, 3, 224, 224]
+        # last_feature_map = tile_encoder(inputs)[2]
+        # hidden_states = last_feature_map.flatten(2).transpose(1, 2)
+        # print(hidden_states.shape) # [4, 196, 1536] -> mat1 and mat2 shapes cannot be multiplied (784x1536 and 768x320)
+        # return hidden_states
+    
     # Logging 
     num_inference_steps = 10
     image_guidance_scale = 0
     guidance_scale = 0
-    inference_batch_size = 8
+    inference_batch_size = 4
     dir_he = Path("/graphics/scratch2/students/grosskop/benchmark_er_testset/valA/")
     dir_ihc_target = Path("/graphics/scratch2/students/grosskop/benchmark_er_testset/valB")
     dir_ihc_genereated = os.path.join(args.output_dir, "generated")
@@ -381,8 +415,9 @@ def main():
             batch = list(map(lambda l: PIL.Image.open(f"{dir_he}/{l:03d}.jpg"), indices))
             tensor_batch = torch.stack([v2.ToTensor()(image) for image in batch])
 
-            ihc_generated = pipe([args.translation_prompt] * len(tensor_batch),
+            ihc_generated = pipe( # [args.translation_prompt] * len(tensor_batch),
                 image=tensor_batch,
+                prompt_embeds=get_image_hidden_states(torch.stack([v2.ToImage()(image) for image in batch])).to(pipe.dtype),
                 num_inference_steps=num_inference_steps,
                 image_guidance_scale=image_guidance_scale,
                 guidance_scale=guidance_scale,
@@ -442,8 +477,9 @@ def main():
             for i in range(args.num_validation_images):
                 translated_images.append(
                     pipeline(
-                        args.translation_prompt,
+                        #args.translation_prompt,
                         image=he_image,
+                        prompt_embeds=get_image_hidden_states(v2.ToImage()(he_image).unsqueeze(0)).to(pipe.dtype),
                         num_inference_steps=20,
                         image_guidance_scale=0,
                         guidance_scale=0,
@@ -646,7 +682,6 @@ def main():
         [
             transforms.RandomCrop(args.resolution),
             transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(), # This is unnecessary
             transforms.Lambda(lambda x: transforms.functional.rotate(x, angle=random.choice([0, 90, 180, 270])))
         ]
     )
@@ -822,7 +857,6 @@ def main():
         safety_checker = None,
         requires_safety_checker = False
     )
-    
 
     log_validation(
         pipeline,
@@ -910,7 +944,10 @@ def main():
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
                 # Predict the noise residual and compute loss
-                model_pred = unet(concatenated_noisy_latents, timesteps, translation_prompt, return_dict=False)[0]
+                original_images = (((batch["he_pixel_values"] + 1) / 2) * 255).to(dtype=torch.uint8)
+                cond_image_hidden_states = get_image_hidden_states(original_images)
+                model_pred = unet(concatenated_noisy_latents, timesteps, cond_image_hidden_states, return_dict=False)[0]
+
                 mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 epoch_mse_losses.append(mse_loss.item())
                 # Gather the losses across all processes for logging (if we use distributed training).
@@ -931,9 +968,41 @@ def main():
                     ema_unet.step(unet.parameters())
                 progress_bar.update(1)
                 global_step += 1
-                accelerator.log({"train_loss": train_loss}, step=global_step)
+                accelerator.log({"train_loss": train_loss, "lr": lr_scheduler.get_last_lr()[0]}, step=global_step)
                 train_loss = 0.0
 
+                # if (global_step > 1 and global_step % 30 == 0):
+                #     if args.use_ema:
+                #         # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                #         ema_unet.store(unet.parameters())
+                #         ema_unet.copy_to(unet.parameters())
+                #     # The models need unwrapping because for compatibility in distributed training mode.
+                #     pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
+                #         args.pretrained_model_name_or_path,
+                #         unet=unwrap_model(unet),
+                #         text_encoder=unwrap_model(text_encoder),
+                #         vae=unwrap_model(vae),
+                #         revision=args.revision,
+                #         variant=args.variant,
+                #         torch_dtype=weight_dtype,
+                #         safety_checker = None,
+                #         requires_safety_checker = False
+                #     )
+                    
+                #     log_validation(
+                #         pipeline,
+                #         args,
+                #         accelerator,
+                #         generator,
+                #     )
+
+                #     if args.use_ema:
+                #         # Switch back to the original UNet parameters.
+                #         ema_unet.restore(unet.parameters())
+
+                #     del pipeline
+                #     torch.cuda.empty_cache()
+                
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
@@ -988,7 +1057,6 @@ def main():
                     requires_safety_checker = False
                 )
                 
-
                 log_validation(
                     pipeline,
                     args,
