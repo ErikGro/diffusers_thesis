@@ -98,6 +98,80 @@ def parse_args():
         required=False,
     )
     parser.add_argument(
+        "--translation_prompt",
+        type=str,
+        default="Transform H&E-stained tissue, featuring pink cytoplasm and blue nuclei, into ER (IHC) stained tissue with brown ER-positive nuclei and light pink counterstained background.",
+        help="The prompt used as text conditioning for i2i translation, will be the same for all batches",
+    )
+    parser.add_argument(
+        "--he_generation_prompt",
+        type=str,
+        default="Transform H&E-stained tissue, featuring pink cytoplasm and blue nuclei, into ER (IHC) stained tissue with brown ER-positive nuclei and light pink counterstained background.",
+        help="The prompt used as text conditioning for i2i translation, will be the same for all batches",
+    )
+    parser.add_argument(
+        "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
+    )
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=1e-4,
+        help="Initial learning rate (after the potential warmup period) to use.",
+    )
+    parser.add_argument(
+        "--prediction_type",
+        type=str,
+        default=None,
+        help="The prediction_type that shall be used for training. Choose between 'epsilon' or 'v_prediction' or leave `None`. If left to `None` the default prediction type of the scheduler: `noise_scheduler.config.prediction_type` is chosen.",
+    )
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        default="constant",
+        help=(
+            'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
+            ' "constant", "constant_with_warmup"]'
+        ),
+    )
+    parser.add_argument(
+        "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
+    )
+    parser.add_argument(
+        "--input_perturbation", type=float, default=0, help="The scale of input perturbation. Recommended 0.1."
+    )
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default=None,
+        choices=["no", "fp16", "bf16"],
+        help=(
+            "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
+            " 1.10.and an Nvidia Ampere GPU.  Default to the value of accelerate config of the current system or the"
+            " flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config."
+        ),
+    )
+    parser.add_argument(
+        "--snr_gamma",
+        type=float,
+        default=None,
+        help="SNR weighting gamma to be used if rebalancing the loss. Recommended value is 5.0. "
+        "More details here: https://arxiv.org/abs/2303.09556.",
+    )
+    parser.add_argument(
+        "--bias_he_ihc",
+        type=float,
+        default=0.5,
+        help="Blends between only he generation at 0 an only he->ihc translation at 1"
+    )
+    parser.add_argument(
+        "--conditioning",
+        type=str,
+        default=None,
+        choices=["input", "xattention", "combined"],
+        help="Choose for conditioning translation by concatenating to input layers, adding via xattention or both",
+    )
+    parser.add_argument("--noise_offset", type=float, default=0, help="The scale of noise offset.")
+    parser.add_argument(
         "--revision",
         type=str,
         default=None,
@@ -141,18 +215,6 @@ def parse_args():
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
-        "--translation_prompt",
-        type=str,
-        default="Transform H&E-stained tissue, featuring pink cytoplasm and blue nuclei, into ER (IHC) stained tissue with brown ER-positive nuclei and light pink counterstained background.",
-        help="The prompt used as text conditioning for i2i translation, will be the same for all batches",
-    )
-    parser.add_argument(
-        "--he_generation_prompt",
-        type=str,
-        default="Transform H&E-stained tissue, featuring pink cytoplasm and blue nuclei, into ER (IHC) stained tissue with brown ER-positive nuclei and light pink counterstained background.",
-        help="The prompt used as text conditioning for i2i translation, will be the same for all batches",
-    )
-    parser.add_argument(
         "--cache_dir",
         type=str,
         default=None,
@@ -167,9 +229,6 @@ def parse_args():
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
         ),
-    )
-    parser.add_argument(
-        "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument(
@@ -190,34 +249,10 @@ def parse_args():
         help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
     )
     parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=1e-4,
-        help="Initial learning rate (after the potential warmup period) to use.",
-    )
-    parser.add_argument(
-        "--prediction_type",
-        type=str,
-        default=None,
-        help="The prediction_type that shall be used for training. Choose between 'epsilon' or 'v_prediction' or leave `None`. If left to `None` the default prediction type of the scheduler: `noise_scheduler.config.prediction_type` is chosen.",
-    )
-    parser.add_argument(
         "--scale_lr",
         action="store_true",
         default=False,
         help="Scale the learning rate by the number of GPUs, gradient accumulation steps, and batch size.",
-    )
-    parser.add_argument(
-        "--lr_scheduler",
-        type=str,
-        default="constant",
-        help=(
-            'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
-            ' "constant", "constant_with_warmup"]'
-        ),
-    )
-    parser.add_argument(
-        "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
     )
     parser.add_argument(
         "--conditioning_dropout_prob",
@@ -235,9 +270,6 @@ def parse_args():
             "Whether or not to allow TF32 on Ampere GPUs. Can be used to speed up training. For more information, see"
             " https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices"
         ),
-    )
-    parser.add_argument(
-        "--input_perturbation", type=float, default=0, help="The scale of input perturbation. Recommended 0.1."
     )
     parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA model.")
     parser.add_argument(
@@ -281,17 +313,6 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--mixed_precision",
-        type=str,
-        default=None,
-        choices=["no", "fp16", "bf16"],
-        help=(
-            "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
-            " 1.10.and an Nvidia Ampere GPU.  Default to the value of accelerate config of the current system or the"
-            " flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config."
-        ),
-    )
-    parser.add_argument(
         "--report_to",
         type=str,
         default="tensorboard",
@@ -327,26 +348,6 @@ def parse_args():
     )
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
-    )
-    parser.add_argument(
-        "--snr_gamma",
-        type=float,
-        default=None,
-        help="SNR weighting gamma to be used if rebalancing the loss. Recommended value is 5.0. "
-        "More details here: https://arxiv.org/abs/2303.09556.",
-    )
-    parser.add_argument(
-        "--bias_he_ihc",
-        type=float,
-        default=0.5,
-        help="Blends between only he generation at 0 an only he->ihc translation at 1"
-    )
-    parser.add_argument(
-        "--conditioning",
-        type=str,
-        default=None,
-        choices=["input", "xattention", "combined"],
-        help="Choose for conditioning translation by concatenating to input layers, adding via xattention or both",
     )
 
     args = parser.parse_args()
@@ -401,7 +402,7 @@ def main():
     )
     
     # Logging 
-    num_inference_steps = 10
+    num_inference_steps = 20
     image_guidance_scale = 0
     guidance_scale = 0
     inference_batch_size = 4
@@ -474,14 +475,17 @@ def main():
             f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
             f" {args.translation_prompt}."
         )
-        # pipeline = pipeline.to(accelerator.device)    
-        pipeline.scheduler = DDIMScheduler.from_config(pipeline.scheduler.config, prediction_type="v_prediction", timestep_spacing="trailing", rescale_betas_zero_snr=True)                                    
+        
+        if args.prediction_type == "v_prediction":
+            pipeline.scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler", prediction_type="v_prediction", timestep_spacing="trailing", rescale_betas_zero_snr=True)
+        elif args.prediction_type == "epsilon":
+            pipeline.scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+        else:
+            raise ValueError("args.prediction_type has to be either epsilon or v_prediction")
+    
         pipeline.set_progress_bar_config(disable=True)
         
-        if torch.backends.mps.is_available():
-            autocast_ctx = nullcontext()
-        else:
-            autocast_ctx = torch.autocast(accelerator.device.type)
+        autocast_ctx = torch.autocast(accelerator.device.type)
 
         translated_images = []
         he_images = []
@@ -495,9 +499,9 @@ def main():
                     pipeline(
                         args.translation_prompt,
                         image=he_image,
-                        num_inference_steps=10,
-                        image_guidance_scale=0,
-                        guidance_scale=0,
+                        num_inference_steps=num_inference_steps,
+                        image_guidance_scale=image_guidance_scale,
+                        guidance_scale=guidance_scale,
                         generator=torch.Generator(device=accelerator.device).manual_seed(i),
                     ).images[0]
                 )
@@ -505,15 +509,13 @@ def main():
                 he_images.append(
                     pipeline(
                         args.he_generation_prompt,
-                        num_inference_steps=10,
+                        num_inference_steps=num_inference_steps,
                         image_guidance_scale=0,
                         guidance_scale=0,
                         generator=torch.Generator(device=accelerator.device).manual_seed(i),
                     ).images[0]
                 )
                 
-            
-
         for tracker in accelerator.trackers:
             if tracker.name == "wandb":
                 tracker.log(
@@ -533,9 +535,7 @@ def main():
                     }
                 )
 
-    # Disable AMP for MPS.
-    if torch.backends.mps.is_available():
-        accelerator.native_amp = False
+
 
     generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
@@ -570,8 +570,13 @@ def main():
             ).repo_id
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler", prediction_type="v_prediction", timestep_spacing="trailing", rescale_betas_zero_snr=True)
-    # noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    if args.prediction_type == "v_prediction":
+        noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler", prediction_type="v_prediction", timestep_spacing="trailing", rescale_betas_zero_snr=True)
+    elif args.prediction_type == "epsilon":
+        noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    else:
+        raise ValueError("args.prediction_type has to be either epsilon or v_prediction")
+        
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
     )
@@ -716,7 +721,6 @@ def main():
         [
             transforms.RandomCrop(args.resolution),
             transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(), # This is unnecessary
             transforms.Lambda(lambda x: transforms.functional.rotate(x, angle=random.choice([0, 90, 180, 270])))
         ]
     )
@@ -802,19 +806,6 @@ def main():
         num_warmup_steps=num_warmup_steps_for_scheduler,
         num_training_steps=num_training_steps_for_scheduler,
     )
-    
-    # def custom_lr_schedule(current_step):
-    #     if single_learning_steps > 1:
-    #         factor = single_steps / single_learning_steps
-    #         learning_rate = (1 - factor) * final_learning_rate / 100 + factor * final_learning_rate
-    #     else:
-    #         learning_rate = final_learning_rate
-        
-    #     weird_factor = 10000
-    #     return learning_rate * weird_factor
-
-    # lr_lambda = lambda step: custom_lr_schedule(step)
-    # lr_scheduler = LambdaLR(optimizer, lr_lambda)
 
     # Prepare everything with our `accelerator`.
     unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -892,36 +883,6 @@ def main():
             first_epoch = global_step // num_update_steps_per_epoch
             resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
     
-    # if args.use_ema:
-    #     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-    #     ema_unet.store(unet.parameters())
-    #     ema_unet.copy_to(unet.parameters())
-    # # The models need unwrapping because for compatibility in distributed training mode.
-    # pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
-    #     args.pretrained_model_name_or_path,
-    #     unet=unwrap_model(unet),
-    #     text_encoder=unwrap_model(text_encoder),
-    #     vae=unwrap_model(vae),
-    #     revision=args.revision,
-    #     variant=args.variant,
-    #     torch_dtype=weight_dtype,
-    #     safety_checker = None,
-    #     requires_safety_checker = False
-    # )
-
-    # log_validation(
-    #     pipeline,
-    #     args,
-    #     accelerator,
-    #     generator,
-    # )
-
-    # if args.use_ema:
-    #     # Switch back to the original UNet parameters.
-    #     ema_unet.restore(unet.parameters())
-
-    # del pipeline
-    # torch.cuda.empty_cache()
     
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
@@ -939,24 +900,18 @@ def main():
                 continue
 
             with accelerator.accumulate(unet):                
+                mask = (torch.rand(len(batch_pixels)) > args.bias_ihc_he).bool()
+
                 batch_pixels = batch["ihc_pixel_values"]
-                mask = (torch.rand(len(batch_pixels)) > 0.5).byte()
-                # mask = torch.zeros(len(batch_pixels)).byte()
                 batch_pixels[mask] = batch["he_pixel_values"][mask]
                 target_latents = vae.encode(batch_pixels.to(weight_dtype)).latent_dist.sample()
                 target_latents = target_latents * vae.config.scaling_factor
 
-                # Sample noise that we'll add to the latents
                 noise = torch.randn_like(target_latents)
-
-                offset_noise = 0.1 * torch.randn(target_latents.shape[0], target_latents.shape[1], 1, 1).to("cuda")
-                noise += offset_noise
-                
-                if args.input_perturbation:
-                    noise += args.input_perturbation * torch.randn_like(noise)
+                noise += args.noise_offset * torch.randn(target_latents.shape[0], target_latents.shape[1], 1, 1).to("cuda") # Add offset noise
+                noise += args.input_perturbation * torch.randn_like(noise) # Input perturbation
                 
                 bsz = target_latents.shape[0]
-                # Sample a random timestep for each image
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=target_latents.device)
                 timesteps = timesteps.long()
 
@@ -971,11 +926,6 @@ def main():
                     
                 # Concatenate the `original_image_embeds` with the `noisy_latents`.
                 concatenated_noisy_latents = torch.cat([noisy_latents, he_image_embeds], dim=1)
-
-                # Get the target for loss depending on the prediction type
-                if args.prediction_type is not None:
-                    # set prediction_type of scheduler if defined
-                    noise_scheduler.register_to_config(prediction_type=args.prediction_type)
                     
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
@@ -1067,7 +1017,7 @@ def main():
         if accelerator.is_main_process:
             accelerator.log({"train_loss_epoch": statistics.mean(epoch_mse_losses)}, step=global_step)
 
-            if (epoch % args.validation_epochs == 0):
+            if (epoch % args.validation_epochs == 0 and epoch != (args.num_train_epochs - 1)):
                 if args.use_ema:
                     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                     ema_unet.store(unet.parameters())
@@ -1116,14 +1066,6 @@ def main():
             requires_safety_checker = False
         )
         pipeline.save_pretrained(args.output_dir)
-
-        if args.push_to_hub:
-            upload_folder(
-                repo_id=repo_id,
-                folder_path=args.output_dir,
-                commit_message="End of training",
-                ignore_patterns=["step_*", "epoch_*"],
-            )
 
         log_validation(
             pipeline,

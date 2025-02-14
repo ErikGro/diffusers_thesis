@@ -9,13 +9,14 @@ export NCCL_P2P_DISABLE="1"
 export NCCL_IB_DISABLE="1"
 
 nohup accelerate launch --gpu_ids $CUDA_VISIBLE_DEVICES train_instruct_pix2pix_jointly.py \
-    --num_train_epochs=300 \
+    --num_train_epochs=1 \
     --validation_epochs=1 \
     --prediction_type="epsilon" \
-    --input_perturbation=0.1 \
     --snr_gamma=5 \
-    --bias_ihc_he=0.5 \
+    --noise_offset=0.1 \
+    --input_perturbation=0.1 \
     --conditioning="input" \
+    --bias_ihc_he=0.5 \
     --output_dir=$OUTPUT_DIR \
     --project="$PROJECT_NAME" \
     --name="$RUN_TITLE" \
@@ -37,4 +38,5 @@ nohup accelerate launch --gpu_ids $CUDA_VISIBLE_DEVICES train_instruct_pix2pix_j
     > $OUTPUT_DIR.log 2>&1 &
 
     # --report_to="wandb" \
-    # --conditioning    choices=["input", "xattention", "combined"],
+    # --prediction_type    "epsilon", "v_prediction"
+    # --conditioning       "input", "xattention", "combined"],
