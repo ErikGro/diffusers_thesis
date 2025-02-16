@@ -895,7 +895,7 @@ def main():
                 bsz_half = bsz // 2  
                 batch_pixels_ihc = batch["ihc_pixel_values"][:bsz_half]
                 batch_pixels_he = batch["he_pixel_values"][:bsz_half]
-                batch_pixels = torch.stack([batch_pixels_he, batch_pixels_ihc])
+                batch_pixels = torch.cat([batch_pixels_he, batch_pixels_ihc])
                 target_latents = vae.encode(batch_pixels.to(weight_dtype)).latent_dist.sample()
                 target_latents = target_latents * vae.config.scaling_factor
 
@@ -910,7 +910,7 @@ def main():
                     
                 target = noise_scheduler.get_velocity(target_latents, noise, timesteps)
                 
-                prompt_embeds = torch.stack([translation_prompt[:bsz_half], he_prompt[:bsz_half]])
+                prompt_embeds = torch.cat([translation_prompt[:bsz_half], he_prompt[:bsz_half]])
 
                 model_pred = unet(concatenated_noisy_latents, timesteps, prompt_embeds, return_dict=False)[0]
                 

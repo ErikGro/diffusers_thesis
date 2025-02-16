@@ -1,6 +1,6 @@
 MODEL_NAME="botp/stable-diffusion-v1-5"
 PROJECT_NAME="Thesis InstructPix2Pix"
-RUN_TITLE="25_02_14 Evaluation VPred gamma 10"
+RUN_TITLE="25_02_16 Cycle baseline"
 RUN_DESCRIPTION="baseline"
 OUTPUT_DIR="${RUN_TITLE// /_}"
 
