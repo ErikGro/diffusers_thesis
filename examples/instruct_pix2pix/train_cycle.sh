@@ -10,7 +10,7 @@ export NCCL_IB_DISABLE="1"
 
 nohup accelerate launch --num_processes=1 --num_machines=1 --mixed_precision=bf16 --dynamo_backend=no --gpu_ids $CUDA_VISIBLE_DEVICES train_instruct_pix2pix_cycle.py \
     --num_train_epochs=300 \
-    --validation_epochs=10 \
+    --validation_epochs=1 \
     --prediction_type="v_prediction" \
     --snr_gamma=10 \
     --noise_offset=0 \
@@ -35,7 +35,6 @@ nohup accelerate launch --num_processes=1 --num_machines=1 --mixed_precision=bf1
     --seed=0 \
     --checkpointing_steps=10000 \
     --checkpoints_total_limit=2 \
-    --report_to="wandb" \
     > $OUTPUT_DIR.log 2>&1 &
 
     # --report_to="wandb" \

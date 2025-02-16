@@ -402,7 +402,7 @@ def main():
     )
     
     # Logging 
-    num_inference_steps = 20
+    num_inference_steps = 10
     image_guidance_scale = 0
     guidance_scale = 0
     inference_batch_size = 4
@@ -414,14 +414,15 @@ def main():
     os.makedirs(dir_he_genereated, exist_ok=True)
 
     def genreateImages(pipe):
-        steps = 1000 // inference_batch_size
+        steps = 16 // inference_batch_size
+        # steps = 1000 // inference_batch_size
         for step in tqdm(range(steps), total=steps):
             indices = list(range(step * inference_batch_size, (step + 1) * inference_batch_size))
             batch = list(map(lambda l: PIL.Image.open(f"{dir_he}/{l:03d}.jpg"), indices))
             tensor_batch = torch.stack([v2.ToTensor()(image) for image in batch])
 
+            # image=tensor_batch,
             ihc_generated = pipe([args.translation_prompt] * len(tensor_batch),
-                image=tensor_batch,
                 num_inference_steps=num_inference_steps,
                 image_guidance_scale=image_guidance_scale,
                 guidance_scale=guidance_scale,
@@ -475,13 +476,7 @@ def main():
             f" {args.translation_prompt}."
         )
         
-        if args.prediction_type == "v_prediction":
-            pipeline.scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler", prediction_type="v_prediction", timestep_spacing="trailing", rescale_betas_zero_snr=True)
-        elif args.prediction_type == "epsilon":
-            pipeline.scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-        else:
-            raise ValueError("args.prediction_type has to be either epsilon or v_prediction")
-    
+        pipeline.scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler", prediction_type="v_prediction", timestep_spacing="trailing", rescale_betas_zero_snr=True)
         pipeline.set_progress_bar_config(disable=True)
         
         autocast_ctx = torch.autocast(accelerator.device.type)
@@ -490,49 +485,49 @@ def main():
         he_images = []
         with autocast_ctx:
             genreateImages(pipeline)
-            ssim_score, psnr_score, fid_ihc, fid_he = computeMetrics()
+            # ssim_score, psnr_score, fid_ihc, fid_he = computeMetrics()
             
-            he_image = PIL.Image.open("val_image_he.jpg")
-            for i in range(args.num_validation_images):
-                translated_images.append(
-                    pipeline(
-                        args.translation_prompt,
-                        image=he_image,
-                        num_inference_steps=num_inference_steps,
-                        image_guidance_scale=image_guidance_scale,
-                        guidance_scale=guidance_scale,
-                        generator=torch.Generator(device=accelerator.device).manual_seed(i),
-                    ).images[0]
-                )
+            # he_image = PIL.Image.open("val_image_he.jpg")
+            # for i in range(args.num_validation_images):
+            #     translated_images.append(
+            #         pipeline(
+            #             args.translation_prompt,
+            #             image=he_image,
+            #             num_inference_steps=num_inference_steps,
+            #             image_guidance_scale=image_guidance_scale,
+            #             guidance_scale=guidance_scale,
+            #             generator=torch.Generator(device=accelerator.device).manual_seed(i),
+            #         ).images[0]
+            #     )
                 
-                he_images.append(
-                    pipeline(
-                        args.he_generation_prompt,
-                        num_inference_steps=num_inference_steps,
-                        image_guidance_scale=0,
-                        guidance_scale=0,
-                        generator=torch.Generator(device=accelerator.device).manual_seed(i),
-                    ).images[0]
-                )
+            #     he_images.append(
+            #         pipeline(
+            #             args.he_generation_prompt,
+            #             num_inference_steps=num_inference_steps,
+            #             image_guidance_scale=0,
+            #             guidance_scale=0,
+            #             generator=torch.Generator(device=accelerator.device).manual_seed(i),
+            #         ).images[0]
+            #     )
                 
-        for tracker in accelerator.trackers:
-            if tracker.name == "wandb":
-                tracker.log(
-                    {
-                        "validation_ihc": [
-                            wandb.Image(image, caption="002.jpg pred")
-                            for i, image in enumerate(translated_images)
-                        ],
-                        "validation_he": [
-                            wandb.Image(image, caption="HE unconditional")
-                            for i, image in enumerate(he_images)
-                        ],
-                        "ssim": ssim_score, 
-                        "psnr": psnr_score, 
-                        "fid ihc": fid_ihc,
-                        "fid he": fid_he,
-                    }
-                )
+        # for tracker in accelerator.trackers:
+        #     if tracker.name == "wandb":
+        #         tracker.log(
+        #             {
+        #                 "validation_ihc": [
+        #                     wandb.Image(image, caption="002.jpg pred")
+        #                     for i, image in enumerate(translated_images)
+        #                 ],
+        #                 "validation_he": [
+        #                     wandb.Image(image, caption="HE unconditional")
+        #                     for i, image in enumerate(he_images)
+        #                 ],
+        #                 "ssim": ssim_score, 
+        #                 "psnr": psnr_score, 
+        #                 "fid ihc": fid_ihc,
+        #                 "fid he": fid_he,
+        #             }
+        #         )
 
 
     # Make one log on every process with the configuration for debugging.
@@ -895,67 +890,42 @@ def main():
                     progress_bar.update(1)
                 continue
 
-            with accelerator.accumulate(unet):                
-                mask_he = (torch.rand(len(batch["ihc_pixel_values"])) > args.bias_he_ihc).bool()
-
-                batch_pixels = batch["ihc_pixel_values"]
-                batch_pixels[mask_he] = batch["he_pixel_values"][mask_he]
+            with accelerator.accumulate(unet):
+                bsz = len(batch["ihc_pixel_values"])    
+                bsz_half = bsz // 2  
+                batch_pixels_ihc = batch["ihc_pixel_values"][:bsz_half]
+                batch_pixels_he = batch["he_pixel_values"][:bsz_half]
+                batch_pixels = torch.stack([batch_pixels_he, batch_pixels_ihc])
                 target_latents = vae.encode(batch_pixels.to(weight_dtype)).latent_dist.sample()
                 target_latents = target_latents * vae.config.scaling_factor
 
                 noise = torch.randn_like(target_latents)
-                noise += args.noise_offset * torch.randn(target_latents.shape[0], target_latents.shape[1], 1, 1).to("cuda") # Add offset noise
-                noise += args.input_perturbation * torch.randn_like(noise) # Input perturbation
-                
-                bsz = target_latents.shape[0]
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=target_latents.device)
-                timesteps = timesteps.long()
 
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=target_latents.device).long()
+
                 noisy_latents = noise_scheduler.add_noise(target_latents, noise, timesteps)
 
-                # Get the additional image embedding for conditioning.
-                # Instead of getting a diagonal Gaussian here, we simply take the mode.
                 he_image_embeds = vae.encode(batch["he_pixel_values"].to(weight_dtype)).latent_dist.mode()
-                he_image_embeds[mask_he] = torch.zeros_like(he_image_embeds)[mask_he]
-                    
-                # Concatenate the `original_image_embeds` with the `noisy_latents`.
                 concatenated_noisy_latents = torch.cat([noisy_latents, he_image_embeds], dim=1)
                     
-                # Get the target for loss depending on the prediction type
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(target_latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                target = noise_scheduler.get_velocity(target_latents, noise, timesteps)
+                
+                prompt_embeds = torch.stack([translation_prompt[:bsz_half], he_prompt[:bsz_half]])
 
-                prompt_embeds = translation_prompt
-                prompt_embeds[mask_he] = he_prompt[mask_he]
-                # Predict the noise residual and compute loss
                 model_pred = unet(concatenated_noisy_latents, timesteps, prompt_embeds, return_dict=False)[0]
                 
-                if args.snr_gamma is None:
-                    mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                else:
-                    # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                    # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                    # This is discussed in Section 4.2 of the same paper.
-                    snr = compute_snr(noise_scheduler, timesteps)
-                    mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
-                        dim=1
-                    )[0]
-                    if noise_scheduler.config.prediction_type == "epsilon":
-                        mse_loss_weights = mse_loss_weights / snr
-                    elif noise_scheduler.config.prediction_type == "v_prediction":
-                        mse_loss_weights = mse_loss_weights / (snr + 1)
+                snr = compute_snr(noise_scheduler, timesteps)
+                mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
+                    dim=1
+                )[0]
+                mse_loss_weights = mse_loss_weights / (snr + 1)
 
-                    mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                    mse_loss = mse_loss.mean(dim=list(range(1, len(mse_loss.shape)))) * mse_loss_weights
-                    mse_loss = mse_loss.mean()
+                mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                mse_loss = mse_loss.mean(dim=list(range(1, len(mse_loss.shape)))) * mse_loss_weights
+                mse_loss = mse_loss.mean()
                     
                 epoch_mse_losses.append(mse_loss.item())
+                
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(mse_loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
