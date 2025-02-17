@@ -1,18 +1,18 @@
 MODEL_NAME="botp/stable-diffusion-v1-5"
 PROJECT_NAME="Thesis InstructPix2Pix"
-RUN_TITLE="25_02_16 Cycle baseline"
+RUN_TITLE="25_02_17 Cycle inversion noise"
 RUN_DESCRIPTION="baseline"
 OUTPUT_DIR="${RUN_TITLE// /_}"
 
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=1
 export NCCL_P2P_DISABLE="1"
 export NCCL_IB_DISABLE="1"
 
 nohup accelerate launch --num_processes=1 --num_machines=1 --mixed_precision=bf16 --dynamo_backend=no --gpu_ids $CUDA_VISIBLE_DEVICES train_instruct_pix2pix_cycle.py \
-    --num_train_epochs=300 \
+    --num_train_epochs=10 \
     --validation_epochs=1 \
     --prediction_type="v_prediction" \
-    --snr_gamma=10 \
+    --snr_gamma=5 \
     --noise_offset=0 \
     --input_perturbation=0 \
     --conditioning="input" \
@@ -22,7 +22,8 @@ nohup accelerate launch --num_processes=1 --num_machines=1 --mixed_precision=bf1
     --name="$RUN_TITLE" \
     --description="$RUN_DESCRIPTION" \
     --pretrained_model_name_or_path=$MODEL_NAME \
-    --train_batch_size=16 \
+    --train_batch_size=4 \
+    --gradient_accumulation_steps=4 \
     --learning_rate=1e-4 \
     --lr_scheduler="cosine" \
     --lr_warmup_steps=1000 \
@@ -33,6 +34,7 @@ nohup accelerate launch --num_processes=1 --num_machines=1 --mixed_precision=bf1
     --gradient_checkpointing \
     --enable_xformers_memory_efficient_attention \
     --seed=0 \
+    --report_to="wandb" \
     --checkpointing_steps=10000 \
     --checkpoints_total_limit=2 \
     > $OUTPUT_DIR.log 2>&1 &

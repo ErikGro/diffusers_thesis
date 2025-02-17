@@ -466,6 +466,58 @@ def main():
         return statistics.mean(ssim_scores), statistics.mean(psnr_scores), fid_ihc, fid_he
 
 
+############ INVERSION DDIM for v-prediction
+## Inversion
+    @torch.no_grad()
+    def invert_v_pred(
+        pipe,
+        start_latents,
+        prompt,
+        num_inference_steps
+    ):
+        num_images_per_prompt = 1
+        text_embeddings = pipe._encode_prompt(
+            prompt, "cuda", num_images_per_prompt, False
+        )
+
+        latents = start_latents.clone()
+        ret_latents = None
+        pipe.scheduler.set_timesteps(num_inference_steps, device="cuda")
+        # Make sure to convert timesteps to a list so you can index them
+        timesteps = list(reversed(pipe.scheduler.timesteps))
+        for i in tqdm(range(1, num_inference_steps), total=num_inference_steps - 1):
+            t = timesteps[i]
+
+            # Prepare the input for the model.
+            latent_model_input = latents
+            latent_model_input = pipe.scheduler.scale_model_input(latent_model_input, t)
+            # The concatenation below might be specific to your model/pipeline.
+            latent_model_input = torch.cat([latent_model_input, torch.zeros_like(latent_model_input)], dim=1)
+            
+            # Get the model prediction, which is now v (not epsilon)
+            v = pipe.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
+
+            # Get the current and next alphas (using your scheduler's cumulative product values)
+            current_t = max(0, t.item() - (1000 // num_inference_steps))
+            next_t = t  # (You may adjust this depending on your scheduler)
+            alpha_t = pipe.scheduler.alphas_cumprod[current_t]
+            alpha_t_next = pipe.scheduler.alphas_cumprod[next_t]
+
+            # Convert the v-prediction to epsilon using:
+            # epsilon = sqrt(1 - alpha_t) * x_t + sqrt(alpha_t) * v
+            eps = (1 - alpha_t).sqrt() * latents + alpha_t.sqrt() * v
+
+            # Inversion update step (this is the reverse DDIM step using epsilon)
+            latents = (
+                (latents - (1 - alpha_t).sqrt() * eps) * (alpha_t_next.sqrt() / alpha_t.sqrt())
+                + (1 - alpha_t_next).sqrt() * eps
+            )
+            
+            ret_latents = latents
+
+        return ret_latents
+
+
     def log_validation(
         pipeline,
         args,
@@ -487,47 +539,63 @@ def main():
             genreateImages(pipeline)
             # ssim_score, psnr_score, fid_ihc, fid_he = computeMetrics()
             
-            # he_image = PIL.Image.open("val_image_he.jpg")
-            # for i in range(args.num_validation_images):
-            #     translated_images.append(
-            #         pipeline(
-            #             args.translation_prompt,
-            #             image=he_image,
-            #             num_inference_steps=num_inference_steps,
-            #             image_guidance_scale=image_guidance_scale,
-            #             guidance_scale=guidance_scale,
-            #             generator=torch.Generator(device=accelerator.device).manual_seed(i),
-            #         ).images[0]
-            #     )
+            he_image = PIL.Image.open("val_image_he.jpg")
+            
+            with torch.no_grad():
+                input_latents = pipeline.vae.encode(v2.ToTensor()(he_image).unsqueeze(0).to("cuda") * 2 - 1)
+            input_latents = 0.18215 * input_latents.latent_dist.sample()
+            inverted_latents = invert_v_pred(pipeline, input_latents, args.he_generation_prompt, num_inference_steps=20 + 1)
+            translated_image_inversion = pipeline(
+                    args.translation_prompt,
+                    image=he_image,
+                    latents=inverted_latents,
+                    num_inference_steps=20,
+                    image_guidance_scale=image_guidance_scale,
+                    guidance_scale=guidance_scale,
+                    generator=torch.Generator(device=accelerator.device).manual_seed(0),
+                ).images[0]
+            
+            for i in range(args.num_validation_images):
+                translated_images.append(
+                    pipeline(
+                        args.translation_prompt,
+                        # image=he_image,
+                        num_inference_steps=num_inference_steps,
+                        image_guidance_scale=image_guidance_scale,
+                        guidance_scale=guidance_scale,
+                        generator=torch.Generator(device=accelerator.device).manual_seed(i),
+                    ).images[0]
+                )
                 
-            #     he_images.append(
-            #         pipeline(
-            #             args.he_generation_prompt,
-            #             num_inference_steps=num_inference_steps,
-            #             image_guidance_scale=0,
-            #             guidance_scale=0,
-            #             generator=torch.Generator(device=accelerator.device).manual_seed(i),
-            #         ).images[0]
-            #     )
+                he_images.append(
+                    pipeline(
+                        args.he_generation_prompt,
+                        num_inference_steps=num_inference_steps,
+                        image_guidance_scale=image_guidance_scale,
+                        guidance_scale=guidance_scale,
+                        generator=torch.Generator(device=accelerator.device).manual_seed(i),
+                    ).images[0]
+                )
                 
-        # for tracker in accelerator.trackers:
-        #     if tracker.name == "wandb":
-        #         tracker.log(
-        #             {
-        #                 "validation_ihc": [
-        #                     wandb.Image(image, caption="002.jpg pred")
-        #                     for i, image in enumerate(translated_images)
-        #                 ],
-        #                 "validation_he": [
-        #                     wandb.Image(image, caption="HE unconditional")
-        #                     for i, image in enumerate(he_images)
-        #                 ],
-        #                 "ssim": ssim_score, 
-        #                 "psnr": psnr_score, 
-        #                 "fid ihc": fid_ihc,
-        #                 "fid he": fid_he,
-        #             }
-        #         )
+        for tracker in accelerator.trackers:
+            if tracker.name == "wandb":
+                tracker.log(
+                    {
+                        "validation_ihc": [
+                            wandb.Image(image, caption="IHC unconditional")
+                            for i, image in enumerate(translated_images)
+                        ],
+                        "validation_he": [
+                            wandb.Image(image, caption="HE unconditional")
+                            for i, image in enumerate(he_images)
+                        ],
+                        "validation_ihc_inversion": wandb.Image(translated_image_inversion, caption="002.jpg inversion pred"),
+                        # "ssim": ssim_score, 
+                        # "psnr": psnr_score, 
+                        # "fid ihc": fid_ihc,
+                        # "fid he": fid_he,
+                    }
+                )
 
 
     # Make one log on every process with the configuration for debugging.
@@ -873,8 +941,7 @@ def main():
             resume_global_step = global_step * args.gradient_accumulation_steps
             first_epoch = global_step // num_update_steps_per_epoch
             resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
-    
-    
+
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
@@ -895,24 +962,24 @@ def main():
                 bsz_half = bsz // 2  
                 batch_pixels_ihc = batch["ihc_pixel_values"][:bsz_half]
                 batch_pixels_he = batch["he_pixel_values"][:bsz_half]
-                batch_pixels = torch.cat([batch_pixels_he, batch_pixels_ihc])
+                batch_pixels = torch.cat([batch_pixels_ihc, batch_pixels_he])
                 target_latents = vae.encode(batch_pixels.to(weight_dtype)).latent_dist.sample()
                 target_latents = target_latents * vae.config.scaling_factor
+                image_embeds = vae.encode(torch.cat([batch_pixels_he, batch_pixels_ihc]).to(weight_dtype)).latent_dist.mode()
 
+                ### Stage 1: Predict noise from noisy latents
                 noise = torch.randn_like(target_latents)
-
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=target_latents.device).long()
 
                 noisy_latents = noise_scheduler.add_noise(target_latents, noise, timesteps)
 
-                he_image_embeds = vae.encode(batch["he_pixel_values"].to(weight_dtype)).latent_dist.mode()
-                concatenated_noisy_latents = torch.cat([noisy_latents, he_image_embeds], dim=1)
+                model_input = torch.cat([noisy_latents, torch.zeros_like(noisy_latents)], dim=1)
                     
                 target = noise_scheduler.get_velocity(target_latents, noise, timesteps)
                 
                 prompt_embeds = torch.cat([translation_prompt[:bsz_half], he_prompt[:bsz_half]])
 
-                model_pred = unet(concatenated_noisy_latents, timesteps, prompt_embeds, return_dict=False)[0]
+                model_pred = unet(model_input, timesteps, prompt_embeds, return_dict=False)[0]
                 
                 snr = compute_snr(noise_scheduler, timesteps)
                 mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
@@ -923,15 +990,46 @@ def main():
                 mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                 mse_loss = mse_loss.mean(dim=list(range(1, len(mse_loss.shape)))) * mse_loss_weights
                 mse_loss = mse_loss.mean()
-                    
+                
                 epoch_mse_losses.append(mse_loss.item())
+                
+                ### Stage 2: Inversion -> and prediction of different staining
+                alpha_t = noise_scheduler.alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+
+                noise_inversion = (1 - alpha_t).sqrt() * noisy_latents + alpha_t.sqrt() * model_pred
+                timesteps_inversion = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=target_latents.device).long()
+                target_latents_inversion = target_latents
+                noisy_latents_inversion = noise_scheduler.add_noise(target_latents_inversion, noise_inversion, timesteps_inversion)
+                
+                model_input_inversion = torch.cat([noisy_latents_inversion, image_embeds], dim=1)
+                model_pred_inversion = unet(model_input_inversion, timesteps_inversion, prompt_embeds, return_dict=False)[0]
+                
+                snr_inversion = compute_snr(noise_scheduler, timesteps_inversion)
+                mse_loss_weights_inversion = torch.stack([snr_inversion, args.snr_gamma * torch.ones_like(timesteps_inversion)], dim=1).min(
+                    dim=1
+                )[0]
+                mse_loss_weights_inversion = mse_loss_weights_inversion / (snr_inversion + 1)
+
+                target_inversion = noise_scheduler.get_velocity(target_latents_inversion, noise_inversion, timesteps_inversion)
+
+                mse_loss_inversion = F.mse_loss(model_pred_inversion.float(), target_inversion.float(), reduction="none")
+                mse_loss_inversion = mse_loss_inversion.mean(dim=list(range(1, len(mse_loss_inversion.shape)))) * mse_loss_weights_inversion
+                mse_loss_inversion = mse_loss_inversion.mean()
+                
+                ### Stage 2: Inversion of translation -> and reconstruction loss on initial inversion latents
+                
+                
+                ### Final loss computation
+                lambda_inversion = 0.1
+                mse_loss_inversion *= lambda_inversion
+                loss_total = mse_loss + mse_loss_inversion
                 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(mse_loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
                 # Backpropagate
-                accelerator.backward(mse_loss)
+                accelerator.backward(loss_total)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
                 optimizer.step()
@@ -944,7 +1042,7 @@ def main():
                     ema_unet.step(unet.parameters())
                 progress_bar.update(1)
                 global_step += 1
-                accelerator.log({"train_loss": train_loss, "lr": lr_scheduler.get_last_lr()[0]}, step=global_step)
+                accelerator.log({"train_loss": train_loss, "mse_loss_inversion": mse_loss_inversion.item(), "lr": lr_scheduler.get_last_lr()[0]}, step=global_step)
                 train_loss = 0.0
 
                 if global_step % args.checkpointing_steps == 0:
